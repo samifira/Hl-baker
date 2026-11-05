@@ -1,0 +1,118 @@
+name: Build HL Baker
+
+# Builds the desktop app for Windows, macOS (Apple Silicon) and Linux, smoke-tests each build,
+# and uploads it as a workflow artifact. Pushing a tag like v1.0.0 also creates a GitHub Release.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: macos-14            # Apple Silicon (Blender 5 has no Intel macOS build)
+            name: macos-arm64
+          - os: ubuntu-22.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"     # must match the bpy wheel
+
+      - name: Linux system libraries for Qt / Blender
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
+            libegl1 libgl1 libsm6 libxi6 libxxf86vm1 libxfixes3 libxrender1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pillow
+
+      - name: Test from source (CLI)
+        run: python hlbake_main.py bake tests/props_low.fbx tests/props_high.fbx -o out_src -m game -s 128 --aa 1 --samples 4 --device CPU --cage-offset 0.3
+
+      - name: Build with PyInstaller
+        run: pyinstaller --noconfirm hlbake.spec
+
+      - name: Locate build
+        id: paths
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            echo "cli=dist/HLBaker.app/Contents/MacOS/hlbake" >> $GITHUB_OUTPUT
+            echo "gui=dist/HLBaker.app/Contents/MacOS/HLBaker" >> $GITHUB_OUTPUT
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            echo "cli=dist/HLBaker/hlbake.exe" >> $GITHUB_OUTPUT
+            echo "gui=dist/HLBaker/HLBaker.exe" >> $GITHUB_OUTPUT
+          else
+            echo "cli=dist/HLBaker/hlbake" >> $GITHUB_OUTPUT
+            echo "gui=dist/HLBaker/HLBaker" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Smoke test packaged CLI (bake)
+        shell: bash
+        run: |
+          "${{ steps.paths.outputs.cli }}" bake tests/props_low.fbx tests/props_high.fbx -o out_frozen \
+            -m all -s 128 --aa 1 --samples 4 --device CPU --cage-offset 0.3
+          ls out_frozen
+          test $(ls out_frozen | wc -l) -eq 14
+
+      - name: Smoke test packaged GUI (loads meshes via its worker, then quits)
+        shell: bash
+        run: |
+          export HLBAKE_SELFTEST="$PWD/selftest.json"
+          "${{ steps.paths.outputs.gui }}" tests/props_low.fbx tests/props_high.fbx &
+          for i in $(seq 1 120); do [ -f selftest.json ] && break; sleep 1; done
+          cat selftest.json
+          python -c "import json; d=json.load(open('selftest.json')); assert d['exit']==0 and len(d['groups'])==2"
+
+      - name: Add licence texts
+        shell: bash
+        run: |
+          DEST=dist/HLBaker
+          [ "$RUNNER_OS" = "macOS" ] && DEST=dist/HLBaker.app/Contents/Resources
+          curl -sSfL https://www.gnu.org/licenses/gpl-3.0.txt -o "$DEST/GPL-3.0.txt"
+          cp LICENSE README.md "$DEST/"
+
+      - name: Package
+        shell: bash
+        run: |
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip ../HLBaker-${{ matrix.name }}.zip HLBaker > /dev/null
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            ditto -c -k --keepParent HLBaker.app ../HLBaker-${{ matrix.name }}.zip
+          else
+            tar -czf ../HLBaker-${{ matrix.name }}.tar.gz HLBaker
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HLBaker-${{ matrix.name }}
+          path: HLBaker-${{ matrix.name }}.*
+          compression-level: 0
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: HLBaker-${{ matrix.name }}.*

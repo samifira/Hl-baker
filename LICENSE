@@ -1,0 +1,16 @@
+HL Baker
+Copyright (C) 2026 the HL Baker authors
+
+This program is free software: you can redistribute it and/or modify it under the terms of the
+GNU General Public License as published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+General Public License for more details: https://www.gnu.org/licenses/gpl-3.0.html
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+HL Baker bundles Blender (the `bpy` module, (C) Blender Foundation, GPL) and Qt / PySide6 (LGPL v3).
+The full GPL-3.0 text is added to every build as GPL-3.0.txt by the CI workflow; before
+distributing a build made by hand, add it yourself (https://www.gnu.org/licenses/gpl-3.0.txt).
