@@ -63,6 +63,9 @@ def _load_gl():
             for name in ("GL", "OpenGL", "WGL"):
                 setattr(p, name, sw)
             p.getExtensionProcedure = gpa
+            gcc = sw.wglGetCurrentContext       # used by PyOpenGL's context checks
+            gcc.restype = ctypes.c_void_p
+            p.GetCurrentContext = gcc
             p.install(vars(_plat))
             GL_DIAG["pyopengl_bound_to"] = "opengl32sw"
     from OpenGL import GL as _GL
