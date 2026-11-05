@@ -16,11 +16,42 @@ from PySide6.QtGui import QImage, QSurfaceFormat
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 try:
-    from OpenGL import GL
+    import OpenGL           # noqa: F401  (OpenGL.GL is imported lazily, see _load_gl)
     HAVE_GL = True
-except Exception:          # PyOpenGL missing
-    GL = None
+except Exception:           # PyOpenGL missing
     HAVE_GL = False
+GL = None
+
+
+def _load_gl():
+    """Import PyOpenGL once a Qt context exists.
+
+    When Qt runs on its bundled software renderer (Windows, opengl32sw.dll), PyOpenGL must call
+    into that same DLL instead of the system opengl32.dll, or its calls see no current context.
+    """
+    global GL
+    if GL is not None:
+        return GL
+    import sys
+    if sys.platform == "win32" and os.environ.get("HLBAKE_SOFTWARE_GL") == "1":
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetModuleHandleW.restype = ctypes.c_void_p
+        k32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        handle = k32.GetModuleHandleW("opengl32sw.dll")
+        if handle:
+            sw = ctypes.WinDLL("opengl32sw.dll", handle=handle)
+            from OpenGL.platform import ctypesloader
+            _orig = ctypesloader.loadLibrary
+
+            def _load(dll_type, name, mode=ctypes.RTLD_GLOBAL):
+                if str(name).lower() == "opengl32":
+                    return sw
+                return _orig(dll_type, name, mode)
+            ctypesloader.loadLibrary = _load
+    from OpenGL import GL as _GL
+    GL = _GL
+    return GL
 
 # viewer channel -> (map key used, label)
 CHANNELS = [
@@ -428,6 +459,7 @@ class Viewport(QOpenGLWidget):
         if not HAVE_GL:
             return
         try:
+            _load_gl()
             ver = GL.glGetString(GL.GL_VERSION)
             if not ver:
                 raise RuntimeError("no OpenGL context")
