@@ -61,13 +61,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # Qt's own opengl32sw.dll is Mesa 11 (OpenGL 3.0 only); replace it with current Mesa (GL 4.5)
-          gh release download --repo pal1000/mesa-dist-win --pattern "*release-msvc.7z" --dir mesa
-          7z x -y -omesa mesa/*.7z > /dev/null
-          ls mesa/x64
+          fetch() {   # $1 = release tag, or "latest"
+            rm -rf mesa && mkdir mesa
+            if [ "$1" = latest ]; then
+              gh release download --repo pal1000/mesa-dist-win --pattern "*release-msvc.7z" --dir mesa
+            else
+              gh release download "$1" --repo pal1000/mesa-dist-win --pattern "*release-msvc.7z" --dir mesa
+            fi
+            for a in mesa/*.7z; do 7z x -y -omesa/x "$a" > /dev/null; done
+            GL=$(find mesa/x -ipath "*x64*" -iname opengl32.dll | head -1)
+          }
+          fetch latest
+          if [ -z "$GL" ]; then
+            echo "No x64 opengl32.dll in the latest package; layout:"; find mesa/x -maxdepth 2 | head -40
+            fetch 26.1.8
+          fi
+          [ -n "$GL" ] || { echo "Mesa OpenGL not found"; exit 1; }
+          SRC=$(dirname "$GL"); echo "Using Mesa from $SRC ($(ls mesa/*.7z))"
           for d in dist/HLBaker/_internal dist/HLBaker/_internal/PySide6; do
-            cp mesa/x64/opengl32.dll "$d/opengl32sw.dll"
+            cp "$GL" "$d/opengl32sw.dll"
             for dep in libgallium_wgl.dll libglapi.dll; do
-              [ -f "mesa/x64/$dep" ] && cp "mesa/x64/$dep" "$d/"
+              [ -f "$SRC/$dep" ] && cp "$SRC/$dep" "$d/"
             done
           done
           ls -la dist/HLBaker/_internal | grep -iE "opengl32sw|gallium|glapi"
