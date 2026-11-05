@@ -1,12 +1,15 @@
 name: Build HL Baker
 
 # Builds the desktop app for Windows, macOS (Apple Silicon) and Linux, smoke-tests each build,
-# and uploads it as a workflow artifact. Pushing a tag like v1.0.0 also creates a GitHub Release.
+# and uploads it as a workflow artifact. Publishing a GitHub Release (or pushing a tag like
+# v1.0.0) also attaches the zipped builds to that release.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  release:
+    types: [published]   # creating a release on GitHub builds and attaches the downloads
   workflow_dispatch:
 
 permissions:

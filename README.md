@@ -67,7 +67,7 @@ The output is `dist/HLBaker/` (`dist/HLBaker.app` on macOS), about 1.1 GB unpack
 zipped, mostly Blender and Cycles. PyInstaller can only build for the platform it runs on.
 To build all three platforms, push this folder to a GitHub repository:
 `.github/workflows/build.yml` builds Windows, macOS and Linux, smoke-tests each build (a real bake
-and a GUI self-test), and attaches zips to a GitHub Release whenever you push a tag like `v1.0.0`.
+and a GUI self-test), and attaches the zips to a GitHub Release whenever you publish one (or push a tag like `v1.0.0`).
 
 **macOS:** the build is not code-signed. On first launch, right-click › Open, or run
 `xattr -dr com.apple.quarantine HLBaker.app`.
