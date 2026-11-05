@@ -990,8 +990,14 @@ class MainWindow(QMainWindow):
                 def finish():
                     self.grab().save(os.path.splitext(selftest)[0] + ".png")
                     with open(selftest, "w") as fh:
+                        base = getattr(sys, "_MEIPASS", "")
+                        sw = [d for d in (base, os.path.join(base, "PySide6"))
+                              if base and os.path.exists(os.path.join(d, "opengl32sw.dll"))]
                         json.dump({"exit": code, "viewer_gl": self.viewer3d.view.ok,
                                    "gl_renderer": self.viewer3d.view.renderer,
+                                   "gl_error": self.viewer3d.view.error,
+                                   "software_gl": os.environ.get("HLBAKE_SOFTWARE_GL") == "1",
+                                   "gl_probe": GL_PROBE, "opengl32sw_in": sw,
                                    "groups": [g.__dict__ for g in self.project.groups]}, fh)
                     QApplication.instance().quit()
                 QTimer.singleShot(2500, finish)
@@ -1177,13 +1183,18 @@ def dark_palette(app):
     app.setStyleSheet(STYLE)
 
 
+GL_PROBE = {}
+
+
 def _gl33_available():
     from PySide6.QtGui import QOpenGLContext, QSurfaceFormat
     ctx = QOpenGLContext()
     ctx.setFormat(QSurfaceFormat.defaultFormat())
-    if not ctx.create():
-        return False
+    created = ctx.create()
     f = ctx.format()
+    GL_PROBE.update(created=created, version=f"{f.majorVersion()}.{f.minorVersion()}")
+    if not created:
+        return False
     return (f.majorVersion(), f.minorVersion()) >= (3, 3)
 
 
