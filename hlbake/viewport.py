@@ -34,7 +34,7 @@ def _slog(*a):
 def _load_gl():
     """Import PyOpenGL once a Qt context exists.
 
-    When Qt runs on its bundled software renderer (Windows, opengl32sw.dll), PyOpenGL must call
+    When Qt runs on its bundled fallback renderer (Windows, opengl32sw.dll), PyOpenGL must call
     into that same DLL instead of the system opengl32.dll, or its calls see no current context.
     """
     global GL
@@ -49,7 +49,9 @@ def _load_gl():
         handle = k32.GetModuleHandleW("opengl32sw.dll")
         GL_DIAG["opengl32sw_loaded"] = bool(handle)
         GL_DIAG["opengl32_loaded"] = bool(k32.GetModuleHandleW("opengl32.dll"))
-        if handle and os.environ.get("HLBAKE_SOFTWARE_GL") == "1":
+        # Qt falls back to opengl32sw.dll by itself when the system OpenGL is too old; if that
+        # module is loaded, it is the one holding our context.
+        if handle:
             # PyOpenGL loads opengl32.dll while its platform module initialises and exports it
             # into OpenGL.platform; point the platform (and those exports) at opengl32sw.dll
             # before OpenGL.GL builds its function wrappers.
