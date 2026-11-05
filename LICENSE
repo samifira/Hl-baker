@@ -11,6 +11,7 @@ General Public License for more details: https://www.gnu.org/licenses/gpl-3.0.ht
 
 SPDX-License-Identifier: GPL-3.0-or-later
 
-HL Baker bundles Blender (the `bpy` module, (C) Blender Foundation, GPL) and Qt / PySide6 (LGPL v3).
+HL Baker bundles Blender (the `bpy` module, (C) Blender Foundation, GPL), Qt / PySide6 (LGPL v3),
+PyOpenGL (BSD) and, in Windows builds, Mesa's llvmpipe software OpenGL renderer (MIT).
 The full GPL-3.0 text is added to every build as GPL-3.0.txt by the CI workflow; before
 distributing a build made by hand, add it yourself (https://www.gnu.org/licenses/gpl-3.0.txt).

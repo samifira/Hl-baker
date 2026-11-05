@@ -54,6 +54,24 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller --noconfirm hlbake.spec
 
+      - name: "Windows: bundle a modern software OpenGL (Mesa llvmpipe) for PCs without GL 3.3"
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Qt's own opengl32sw.dll is Mesa 11 (OpenGL 3.0 only); replace it with current Mesa (GL 4.5)
+          gh release download --repo pal1000/mesa-dist-win --pattern "*release-msvc.7z" --dir mesa
+          7z x -y -omesa mesa/*.7z > /dev/null
+          ls mesa/x64
+          for d in dist/HLBaker/_internal dist/HLBaker/_internal/PySide6; do
+            cp mesa/x64/opengl32.dll "$d/opengl32sw.dll"
+            for dep in libgallium_wgl.dll libglapi.dll; do
+              [ -f "mesa/x64/$dep" ] && cp "mesa/x64/$dep" "$d/"
+            done
+          done
+          ls -la dist/HLBaker/_internal | grep -iE "opengl32sw|gallium|glapi"
+
       - name: Locate build
         id: paths
         shell: bash

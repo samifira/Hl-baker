@@ -43,15 +43,19 @@ def _load_gl():
         GL_DIAG["opengl32sw_loaded"] = bool(handle)
         GL_DIAG["opengl32_loaded"] = bool(k32.GetModuleHandleW("opengl32.dll"))
         if handle and os.environ.get("HLBAKE_SOFTWARE_GL") == "1":
+            # PyOpenGL loads opengl32.dll while its platform module initialises and exports it
+            # into OpenGL.platform; point the platform (and those exports) at opengl32sw.dll
+            # before OpenGL.GL builds its function wrappers.
             sw = ctypes.WinDLL("opengl32sw.dll", handle=handle)
-            from OpenGL.platform import ctypesloader
-            _orig = ctypesloader.loadLibrary
-
-            def _load(dll_type, name, mode=ctypes.RTLD_GLOBAL):
-                if str(name).lower() == "opengl32":
-                    return sw
-                return _orig(dll_type, name, mode)
-            ctypesloader.loadLibrary = _load
+            import OpenGL.platform as _plat
+            p = _plat.PLATFORM
+            gpa = sw.wglGetProcAddress
+            gpa.restype = ctypes.c_void_p
+            for name in ("GL", "OpenGL", "WGL"):
+                setattr(p, name, sw)
+            p.getExtensionProcedure = gpa
+            p.install(vars(_plat))
+            GL_DIAG["pyopengl_bound_to"] = "opengl32sw"
     from OpenGL import GL as _GL
     GL = _GL
     return GL
