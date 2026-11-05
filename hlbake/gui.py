@@ -1202,7 +1202,8 @@ def _gl33_available():
 def _relaunch_with_software_gl(argv):
     """Windows: start again with Qt's bundled software OpenGL (opengl32sw.dll)."""
     import subprocess
-    env = dict(os.environ, HLBAKE_SOFTWARE_GL="1")
+    # Mesa: use the llvmpipe CPU renderer directly (skip its Direct3D 12 path, which needs dxil.dll)
+    env = dict(os.environ, HLBAKE_SOFTWARE_GL="1", GALLIUM_DRIVER="llvmpipe")
     if getattr(sys, "frozen", False):
         cmd = [sys.executable, *argv]
     else:
@@ -1212,27 +1213,54 @@ def _relaunch_with_software_gl(argv):
     subprocess.Popen(cmd, env=env)
 
 
+def _selftest_log():
+    """When self-testing, log progress and native crashes to <selftest>.log (windowed apps have
+    no console)."""
+    st = os.environ.get("HLBAKE_SELFTEST")
+    if not st:
+        return lambda *a: None
+    import faulthandler
+    path = os.path.splitext(st)[0] + ".log"
+    fh = open(path, "a", buffering=1)
+    faulthandler.enable(fh)
+    if sys.stderr is None:
+        sys.stderr = fh
+    if sys.stdout is None:
+        sys.stdout = fh
+    def log(*a):
+        fh.write(f"[pid {os.getpid()}] " + " ".join(str(x) for x in a) + "\n")
+    return log
+
+
 def main(argv=None):
     from PySide6.QtCore import QCoreApplication
+    slog = _selftest_log()
+    slog("start", "software_gl=" + os.environ.get("HLBAKE_SOFTWARE_GL", "0"))
     request_gl_format()
     software_gl = os.environ.get("HLBAKE_SOFTWARE_GL") == "1"
     if software_gl:
         QCoreApplication.setAttribute(Qt.AA_UseSoftwareOpenGL)
     app = QApplication(sys.argv[:1])
+    slog("QApplication created")
     if sys.platform == "win32" and not software_gl and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
         try:
-            if not _gl33_available():
+            ok = _gl33_available()
+            slog("GL 3.3 probe:", ok, GL_PROBE)
+            if not ok:
                 _relaunch_with_software_gl(list(argv or []))
+                slog("relaunched with software OpenGL")
                 return 0
-        except Exception:
-            pass
+        except Exception as e:
+            slog("probe failed:", e)
     app.setApplicationName(APP_NAME)
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if os.path.exists(os.path.join(base, "icon.png")):
         app.setWindowIcon(QIcon(os.path.join(base, "icon.png")))
     dark_palette(app)
     win = MainWindow()
+    slog("window created")
     win.show()
+    slog("window shown")
     args = [a for a in (argv or []) if not a.startswith("-")]
     projects = [a for a in args if a.endswith(PROJECT_EXT)]
     if projects:

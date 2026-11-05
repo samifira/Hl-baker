@@ -24,6 +24,13 @@ GL = None
 GL_DIAG = {}
 
 
+def _slog(*a):
+    st = os.environ.get("HLBAKE_SELFTEST")
+    if st:
+        with open(os.path.splitext(st)[0] + ".log", "a") as fh:
+            fh.write(f"[pid {os.getpid()}] " + " ".join(str(x) for x in a) + "\n")
+
+
 def _load_gl():
     """Import PyOpenGL once a Qt context exists.
 
@@ -465,6 +472,7 @@ class Viewport(QOpenGLWidget):
     def initializeGL(self):
         if not HAVE_GL:
             return
+        _slog("initializeGL")
         try:
             ctx = self.context()
             fmt = ctx.format() if ctx else None
@@ -481,8 +489,11 @@ class Viewport(QOpenGLWidget):
                 GL_DIAG["qt_renderer"] = str(f.glGetString(0x1F01))
             except Exception as e:
                 GL_DIAG["qt_funcs_err"] = str(e)
+            _slog("qt context", GL_DIAG)
             _load_gl()
+            _slog("pyopengl loaded", GL_DIAG.get("pyopengl_bound_to"))
             ver = GL.glGetString(GL.GL_VERSION)
+            _slog("GL_VERSION", ver)
             if not ver:
                 raise RuntimeError("no OpenGL context")
             self.p_low = Program(LOW_VS, LOW_FS)

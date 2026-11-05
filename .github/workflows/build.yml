@@ -120,6 +120,7 @@ jobs:
             "$GUI" tests/props_low.fbx tests/props_high.fbx &
           fi
           for i in $(seq 1 150); do [ -f "$HLBAKE_SELFTEST" ] && break; sleep 1; done
+          echo "--- self-test log"; cat "${HLBAKE_SELFTEST%.json}.log" 2>/dev/null || true; echo "---"
           cat "$HLBAKE_SELFTEST"
           python -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['exit']==0 and len(d['groups'])==2; print('3D viewer OpenGL:', d.get('viewer_gl'), d.get('gl_renderer'), '| software:', d.get('software_gl'), '| probe:', d.get('gl_probe'), '| sw dll:', d.get('opengl32sw_in'), '| err:', d.get('gl_error'), '| diag:', d.get('gl_diag'))" "$HLBAKE_SELFTEST"
 
