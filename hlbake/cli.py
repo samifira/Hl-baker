@@ -30,12 +30,13 @@ def run_worker(argv):
     ap.add_argument("--samples", type=int, default=32)
     ap.add_argument("--show", default="low")
     ap.add_argument("--preview-dir", default="")
+    ap.add_argument("--mesh-out", default="")
     a = ap.parse_args(argv)
     try:
         project = Project.load(a.project)
         from . import scene
         if a.command == "scan":
-            _emit(event="scan", **scene.scan(project))
+            _emit(event="scan", **scene.scan(project, mesh_out=a.mesh_out or None))
         elif a.command == "bake":
             t0 = time.time()
             written = scene.bake(project, _emit, preview_dir=a.preview_dir or None)

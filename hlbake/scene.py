@@ -172,10 +172,30 @@ def describe(items):
     return out
 
 
-def scan(project):
+def setname_for(s, g):
+    return core.texture_set_name(s) if s.output_mode == 'SINGLE' else bpy.path.clean_name(g.name)
+
+
+def scan(project, mesh_out=None):
     items = load_project_meshes(project)
     groups, unmatched = auto_groups(items, project.default_cage_offset, project.default_max_ray)
-    return {"objects": describe(items), "groups": [g.__dict__ for g in groups], "unmatched": unmatched}
+    result = {"objects": describe(items), "groups": [g.__dict__ for g in groups],
+              "unmatched": unmatched}
+    if mesh_out:
+        from .meshexport import export_display_meshes
+        if project.groups:          # keep the user's groups (e.g. opened project)
+            rgroups, _ = resolve_groups(project, items)
+        else:
+            rgroups = [core.RuntimeGroup(g.name, bpy.data.objects[g.low],
+                                         [bpy.data.objects[h] for h in g.highs], None, g.cage_offset)
+                       for g in groups]
+        try:
+            export_display_meshes(rgroups, mesh_out, lambda g: setname_for(project.settings, g),
+                                  project.settings.use_uv)
+            result["mesh_file"] = mesh_out
+        except Exception as e:  # the viewer is optional; never fail a scan because of it
+            result["mesh_error"] = str(e)
+    return result
 
 
 # ---------------------------------------------------------------------------

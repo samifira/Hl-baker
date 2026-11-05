@@ -22,6 +22,7 @@ from .config import (Project, FileEntry, GroupConfig, Settings, MAPS, MAP_ORDER,
                      GAME_PRESET, FORMATS, FORMAT_LABELS, MESH_EXTS, PROJECT_EXT, APP_NAME,
                      APP_VERSION, guess_file_role, enabled_maps)
 from .cli import EVENT_PREFIX
+from .viewport import ViewerPanel, request_gl_format
 
 ROLE_LABELS = [("auto", "Auto (by name)"), ("low", "Low poly"), ("high", "High poly"), ("cage", "Cage")]
 SIZES = [256, 512, 1024, 2048, 4096, 8192]
@@ -196,6 +197,7 @@ class MainWindow(QMainWindow):
         self.objects = []            # last scan result
         self.preview_dir = tempfile.mkdtemp(prefix="hlbake_prev_")
         self.render_path = os.path.join(self.preview_dir, "render.png")
+        self.mesh_path = os.path.join(self.preview_dir, "meshes.npz")
         self.map_previews = {}       # label -> png
         self._loading = False
         self.qs = QSettings("HLBaker", "HLBaker")
@@ -291,8 +293,10 @@ class MainWindow(QMainWindow):
 
         # right side
         self.tabs = QTabWidget()
+        self.viewer3d = ViewerPanel()
+        self.tabs.addTab(self.viewer3d, "3D Viewer")
         self.tabs.addTab(self._build_maps_view(), "Baked Maps")
-        self.tabs.addTab(self._build_render_view(), "3D Preview")
+        self.tabs.addTab(self._build_render_view(), "Cycles Render")
         self.logbox = QPlainTextEdit(readOnly=True)
         self.logbox.setFont(QFont("Monospace", 9))
         self.logbox.setMaximumBlockCount(5000)
@@ -436,6 +440,8 @@ class MainWindow(QMainWindow):
         v.addWidget(opts)
         for k in MAP_ORDER:
             self.w["map_" + k].toggled.connect(self.update_option_visibility)
+        self.w["normal_flip_y"].currentIndexChanged.connect(
+            lambda _i: self.viewer3d.set_directx(self.w["normal_flip_y"].currentData() == "DIRECTX"))
         self.w["height_auto"].toggled.connect(self.update_option_visibility)
         self.w["curv_method"].currentIndexChanged.connect(self.update_option_visibility)
         self.opts_box = opts
@@ -541,7 +547,7 @@ class MainWindow(QMainWindow):
         self.render_btn = QPushButton("Render")
         self.render_btn.clicked.connect(self.render_preview)
         self.auto_render = QCheckBox("after bake")
-        self.auto_render.setChecked(True)
+        self.auto_render.setChecked(False)
         for lab, wd in (("Orbit", self.yaw), ("Tilt", self.pitch), ("Samples", self.r_samples),
                         ("", self.r_show)):
             if lab:
@@ -601,6 +607,7 @@ class MainWindow(QMainWindow):
         self.refresh_files_table()
         self.refresh_groups_tree()
         self.update_option_visibility()
+        self.viewer3d.set_directx(s.normal_flip_y == "DIRECTX")
         self._loading = False
         self.update_title()
 
@@ -720,10 +727,16 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 0)
         self.progress.setFormat("Loading meshes…")
         self.set_busy(True)
-        self.worker.start("scan", self.project)
+        if reset:
+            self.viewer3d.view.clear_textures()
+        self.worker.start("scan", self.project, ["--mesh-out", self.mesh_path])
 
     def apply_scan(self, ev):
         self.objects = ev.get("objects", [])
+        if ev.get("mesh_file"):
+            self.viewer3d.view.load_meshes(ev["mesh_file"])
+        if ev.get("mesh_error"):
+            self.log("3D viewer: could not export meshes: " + ev["mesh_error"])
         groups = [GroupConfig(**g) for g in ev.get("groups", [])]
         for g in groups:   # keep per-group tweaks across rescans
             old = self._old_groups.get(g.name)
@@ -738,6 +751,7 @@ class MainWindow(QMainWindow):
         self.w["use_uv"].addItems([""] + uvs)
         self.w["use_uv"].setEditText(cur)
         self.refresh_groups_tree()
+        self.sync_viewer_cages()
         hints = []
         if ev.get("unmatched"):
             hints.append("No high poly for: " + ", ".join(ev["unmatched"]))
@@ -755,6 +769,10 @@ class MainWindow(QMainWindow):
         tris = sum(o["tris"] for o in self.objects if o["role"] == "high")
         self.statusBar().showMessage(f"{n_low} low / {n_high} high meshes ({tris:,} high tris) "
                                      f"in {len(groups)} group(s)")
+
+    def sync_viewer_cages(self):
+        for g in self.project.groups:
+            self.viewer3d.view.set_cage_offset(g.name, g.cage_offset)
 
     def refresh_groups_tree(self):
         t = self.groups_tree
@@ -811,6 +829,8 @@ class MainWindow(QMainWindow):
         if g:
             setattr(g, attr, v)
             self._update_group_row(g)
+            if attr == "cage_offset":
+                self.viewer3d.view.set_cage_offset(g.name, v)
 
     def _update_group_row(self, g):
         gi = self.project.groups.index(g)
@@ -826,6 +846,7 @@ class MainWindow(QMainWindow):
             g.cage_offset = self.g_offset.value()
             g.max_ray = self.g_maxray.value()
         self.refresh_groups_tree()
+        self.sync_viewer_cages()
 
     def group_item_changed(self, item, col):
         d = item.data(0, Qt.UserRole)
@@ -910,7 +931,7 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 0)
         self.progress.setFormat("Rendering preview…")
         self.set_busy(True)
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(2)
         self.worker.start("render", self.project, ["--out", self.render_path,
                                                    "--yaw", str(self.yaw.value()),
                                                    "--pitch", str(self.pitch.value()),
@@ -932,6 +953,7 @@ class MainWindow(QMainWindow):
         elif e == "map_done":
             self.log(f"  wrote {ev['path']}", dim=True)
             if ev.get("preview"):
+                self.viewer3d.view.set_texture(ev["set"], ev["map"], ev["preview"])
                 label = f"{ev['set']}  {MAPS[ev['map']][0]}"
                 it = QListWidgetItem(QIcon(ev["preview"]), label)
                 it.setData(Qt.UserRole, ev["preview"])
@@ -964,10 +986,14 @@ class MainWindow(QMainWindow):
         if cmd == "scan":
             self.refresh_groups_tree()
             selftest = os.environ.get("HLBAKE_SELFTEST")
-            if selftest:   # smoke test used by CI: report groups and quit
-                with open(selftest, "w") as fh:
-                    json.dump({"exit": code, "groups": [g.__dict__ for g in self.project.groups]}, fh)
-                QApplication.instance().quit()
+            if selftest:   # smoke test used by CI: report groups, screenshot, quit
+                def finish():
+                    self.grab().save(os.path.splitext(selftest)[0] + ".png")
+                    with open(selftest, "w") as fh:
+                        json.dump({"exit": code, "viewer_gl": self.viewer3d.view.ok,
+                                   "groups": [g.__dict__ for g in self.project.groups]}, fh)
+                    QApplication.instance().quit()
+                QTimer.singleShot(2500, finish)
         if self._pending_render:
             self._pending_render = False
             QTimer.singleShot(50, self.render_preview)
@@ -1014,7 +1040,8 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, 0)
             self.progress.setFormat("Loading meshes…")
             self._restore_groups = saved_groups
-            self.worker.start("scan", self.project)
+            self.viewer3d.view.clear_textures()
+            self.worker.start("scan", self.project, ["--mesh-out", self.mesh_path])
         self.load_existing_maps()
 
     def load_existing_maps(self):
@@ -1024,9 +1051,15 @@ class MainWindow(QMainWindow):
         if not s.output_dir or not os.path.isdir(s.output_dir) or ext == "exr":
             return
         self.thumbs.clear()
+        suffix_to_key = {v[1]: k for k, v in MAPS.items()}
         for f in sorted(os.listdir(s.output_dir)):
             if f.endswith("." + ext):
                 p = os.path.join(s.output_dir, f)
+                stem = os.path.splitext(f)[0]
+                for suf in sorted(suffix_to_key, key=len, reverse=True):
+                    if stem.endswith("_" + suf):
+                        self.viewer3d.view.set_texture(stem[:-len(suf) - 1], suffix_to_key[suf], p)
+                        break
                 it = QListWidgetItem(QIcon(p), os.path.splitext(f)[0])
                 it.setData(Qt.UserRole, p)
                 it.setData(Qt.UserRole + 1, p)
@@ -1144,6 +1177,7 @@ def dark_palette(app):
 
 
 def main(argv=None):
+    request_gl_format()
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

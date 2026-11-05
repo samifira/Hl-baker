@@ -10,7 +10,8 @@ block_cipher = None
 datas, binaries, hiddenimports = [], [], []
 
 # --- Blender (bpy) : the whole package incl. its data folder (scripts, Cycles kernels, ...)
-for pkg in ("bpy", "numpy", "zstandard", "cattrs", "attrs", "attr", "requests", "urllib3", "certifi", "idna", "charset_normalizer"):
+for pkg in ("bpy", "numpy", "zstandard", "cattrs", "attrs", "attr", "requests", "urllib3", "certifi",
+            "idna", "charset_normalizer", "OpenGL"):
     try:
         d, b, h = collect_all(pkg)
         datas += d; binaries += b; hiddenimports += h

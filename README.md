@@ -17,7 +17,10 @@ Blender's Cycles renderer, which is bundled inside. Users don't need Blender ins
   plus Albedo / Roughness / Metalness / Emissive / Opacity taken from the high poly's materials
 - **Anti-aliasing** by supersampling (1x / 4x / 16x), **edge padding** in pixels or fill the whole texture
 - **Output:** one texture set or per group; PNG 8/16, TGA, TIFF 16, EXR 32
-- **Map viewer** (zoom/pan) and a **3D preview render** of the low poly with the baked maps
+- **Live 3D viewer** (OpenGL): orbit around the low poly shaded with the baked maps, updated as
+  each map finishes. Toggle the normal map and AO, inspect any single map or a UV checker, and
+  show the high poly, the cage at each group's offset (updates live as you change it) and a wireframe
+- **2D map viewer** (zoom/pan) and an offline **Cycles render** of the low poly with the baked maps
 - **Projects** (`.hlbake`) save files, groups and settings
 - **Command line** for batch and pipeline use
 - **GPU baking** (OptiX / CUDA / HIP / Metal / oneAPI), falling back to CPU automatically
@@ -28,7 +31,11 @@ Blender's Cycles renderer, which is bundled inside. Users don't need Blender ins
    A file's role is guessed from its name. Change it in the *Role* column if needed.
 2. Check the groups. Set a **cage offset** large enough for rays to start outside the high poly.
 3. Tick the maps, pick resolution, anti-aliasing and padding, and choose the output folder.
-4. Click **Bake**. Thumbnails appear as each map finishes, and the 3D preview renders afterwards.
+4. Click **Bake**. Each map appears on the model in the **3D Viewer** as soon as it's done.
+
+**3D Viewer controls:** left-drag orbit, right- or middle-drag pan, wheel zoom, Shift+right-drag
+rotate the light, F or double-click frame. Keys: N normal map, H high poly, C cage, W wireframe,
+L low poly, 0–9 switch channel.
 
 ## Command line
 
@@ -74,7 +81,7 @@ and a GUI self-test), and attaches the zips to a GitHub Release whenever you pub
 
 ## How it works
 
-The window (PySide6) never loads Blender. Each scan, bake or preview runs in a separate worker
+The window (PySide6, with an OpenGL 3.3 viewport through PyOpenGL) never loads Blender. Each scan, bake or preview runs in a separate worker
 process (`hlbake worker …`) that imports `bpy`, so the UI stays responsive, **Cancel** kills a
 bake immediately, and a crash in a bake can't take the app down. The engine (`hlbake/core.py`) is
 the same one used by the Blender add-on in `blender_addon/hl_baker.py`.

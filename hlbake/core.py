@@ -914,7 +914,7 @@ def enable_gpu():
     return False
 
 
-def write_preview(rgb, map_key, path, needs_srgb, scene, max_size=1024):
+def write_preview(rgb, map_key, path, needs_srgb, scene, max_size=2048):
     """8-bit sRGB PNG thumbnail for the GUI."""
     a = np.asarray(rgb, np.float32)
     h, w = a.shape[:2]

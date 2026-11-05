@@ -28,8 +28,6 @@ jobs:
           - os: ubuntu-22.04
             name: linux-x64
     runs-on: ${{ matrix.os }}
-    env:
-      QT_QPA_PLATFORM: offscreen
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +41,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 \
             libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
-            libegl1 libgl1 libsm6 libxi6 libxxf86vm1 libxfixes3 libxrender1
+            libegl1 libgl1 libsm6 libxi6 libxxf86vm1 libxfixes3 libxrender1 xvfb libgl1-mesa-dri
 
       - name: Install Python dependencies
         run: |
@@ -79,14 +77,25 @@ jobs:
           ls out_frozen
           test $(ls out_frozen | wc -l) -eq 14
 
-      - name: Smoke test packaged GUI (loads meshes via its worker, then quits)
+      - name: Smoke test packaged GUI (loads meshes via its worker, screenshots, quits)
         shell: bash
         run: |
-          export HLBAKE_SELFTEST="$PWD/selftest.json"
-          "${{ steps.paths.outputs.gui }}" tests/props_low.fbx tests/props_high.fbx &
-          for i in $(seq 1 120); do [ -f selftest.json ] && break; sleep 1; done
-          cat selftest.json
-          python -c "import json; d=json.load(open('selftest.json')); assert d['exit']==0 and len(d['groups'])==2"
+          export HLBAKE_SELFTEST="$PWD/selftest-${{ matrix.name }}.json"
+          GUI="${{ steps.paths.outputs.gui }}"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a -s "-screen 0 1600x1000x24" "$GUI" tests/props_low.fbx tests/props_high.fbx &
+          else
+            "$GUI" tests/props_low.fbx tests/props_high.fbx &
+          fi
+          for i in $(seq 1 150); do [ -f "$HLBAKE_SELFTEST" ] && break; sleep 1; done
+          cat "$HLBAKE_SELFTEST"
+          python -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['exit']==0 and len(d['groups'])==2; print('3D viewer OpenGL:', d.get('viewer_gl'))" "$HLBAKE_SELFTEST"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot-${{ matrix.name }}
+          path: selftest-${{ matrix.name }}.*
 
       - name: Add licence texts
         shell: bash
