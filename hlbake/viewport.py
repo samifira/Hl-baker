@@ -594,7 +594,11 @@ class Viewport(QOpenGLWidget):
     def paintGL(self):
         if not self.ok:
             return
+        self._frames = getattr(self, "_frames", 0) + 1
+        trace = _slog if self._frames <= 2 else (lambda *a: None)
+        trace("paint", self._frames, "pending meshes:", bool(self._pending_meshes))
         self._process_pending()
+        trace("pending processed; groups:", len(self.groups))
         dpr = self.devicePixelRatioF()
         w, h = int(self.width() * dpr), int(self.height() * dpr)
         GL.glViewport(0, 0, w, h)
@@ -620,6 +624,7 @@ class Viewport(QOpenGLWidget):
         ly = math.radians(self.light_yaw + self.yaw)
         light = np.array([math.sin(ly) * 0.7, -math.cos(ly) * 0.7, 0.75], np.float32)
 
+        trace("bg drawn")
         # ground grid
         if self.groups:
             self.p_line.use()
@@ -631,6 +636,7 @@ class Viewport(QOpenGLWidget):
             self.p_line.set("uColor", (0.32, 0.33, 0.36, 1.0))
             self.grid.draw_lines()
 
+        trace("grid drawn")
         if self.show_low:
             self.p_low.use()
             pl = self.p_low
@@ -664,6 +670,7 @@ class Viewport(QOpenGLWidget):
                 GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
             GL.glActiveTexture(GL.GL_TEXTURE0)
 
+        trace("low drawn")
         if self.show_high:
             self.p_solid.use()
             self.p_solid.set("uVP", VP)
@@ -692,6 +699,7 @@ class Viewport(QOpenGLWidget):
                 self.p_line.set("uColor", (1.0, 0.45, 0.15, 1.0))
             GL.glDepthFunc(GL.GL_LEQUAL)
             GL.glDisable(GL.GL_BLEND)
+        trace("frame done")
         GL.glBindVertexArray(0)
 
     # ------------------------------------------------------------- input

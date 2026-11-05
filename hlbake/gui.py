@@ -1236,6 +1236,10 @@ def main(argv=None):
     from PySide6.QtCore import QCoreApplication
     slog = _selftest_log()
     slog("start", "software_gl=" + os.environ.get("HLBAKE_SOFTWARE_GL", "0"))
+    # Only read by Mesa (Qt's Windows fallback renderer, opengl32sw.dll): use its stable CPU
+    # renderer rather than the D3D12 translation layer. Real GPU drivers ignore it.
+    if sys.platform == "win32":
+        os.environ.setdefault("GALLIUM_DRIVER", "llvmpipe")
     request_gl_format()
     software_gl = os.environ.get("HLBAKE_SOFTWARE_GL") == "1"
     if software_gl:
