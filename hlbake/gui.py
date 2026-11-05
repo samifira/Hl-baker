@@ -998,6 +998,7 @@ class MainWindow(QMainWindow):
                                    "gl_error": self.viewer3d.view.error,
                                    "software_gl": os.environ.get("HLBAKE_SOFTWARE_GL") == "1",
                                    "gl_probe": GL_PROBE, "opengl32sw_in": sw,
+                                   "gl_diag": __import__("hlbake.viewport", fromlist=["GL_DIAG"]).GL_DIAG,
                                    "groups": [g.__dict__ for g in self.project.groups]}, fh)
                     QApplication.instance().quit()
                 QTimer.singleShot(2500, finish)

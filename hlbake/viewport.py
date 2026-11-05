@@ -21,6 +21,7 @@ try:
 except Exception:           # PyOpenGL missing
     HAVE_GL = False
 GL = None
+GL_DIAG = {}
 
 
 def _load_gl():
@@ -33,13 +34,15 @@ def _load_gl():
     if GL is not None:
         return GL
     import sys
-    if sys.platform == "win32" and os.environ.get("HLBAKE_SOFTWARE_GL") == "1":
+    if sys.platform == "win32":
         import ctypes
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.GetModuleHandleW.restype = ctypes.c_void_p
         k32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
         handle = k32.GetModuleHandleW("opengl32sw.dll")
-        if handle:
+        GL_DIAG["opengl32sw_loaded"] = bool(handle)
+        GL_DIAG["opengl32_loaded"] = bool(k32.GetModuleHandleW("opengl32.dll"))
+        if handle and os.environ.get("HLBAKE_SOFTWARE_GL") == "1":
             sw = ctypes.WinDLL("opengl32sw.dll", handle=handle)
             from OpenGL.platform import ctypesloader
             _orig = ctypesloader.loadLibrary
@@ -459,6 +462,21 @@ class Viewport(QOpenGLWidget):
         if not HAVE_GL:
             return
         try:
+            ctx = self.context()
+            fmt = ctx.format() if ctx else None
+            GL_DIAG["qt_ctx_valid"] = bool(ctx and ctx.isValid())
+            GL_DIAG["qt_format"] = f"{fmt.majorVersion()}.{fmt.minorVersion()}" if fmt else None
+            try:
+                GL_DIAG["qt_is_software"] = bool(ctx and ctx.isOpenGLES()) and "gles" or \
+                    __import__("PySide6.QtGui", fromlist=["QOpenGLContext"]).QOpenGLContext.openGLModuleType().name
+            except Exception as e:
+                GL_DIAG["qt_module_err"] = str(e)
+            try:
+                f = ctx.functions()
+                GL_DIAG["qt_glversion"] = str(f.glGetString(0x1F02))
+                GL_DIAG["qt_renderer"] = str(f.glGetString(0x1F01))
+            except Exception as e:
+                GL_DIAG["qt_funcs_err"] = str(e)
             _load_gl()
             ver = GL.glGetString(GL.GL_VERSION)
             if not ver:
