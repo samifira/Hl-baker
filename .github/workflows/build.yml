@@ -89,7 +89,7 @@ jobs:
           fi
           for i in $(seq 1 150); do [ -f "$HLBAKE_SELFTEST" ] && break; sleep 1; done
           cat "$HLBAKE_SELFTEST"
-          python -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['exit']==0 and len(d['groups'])==2; print('3D viewer OpenGL:', d.get('viewer_gl'))" "$HLBAKE_SELFTEST"
+          python -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['exit']==0 and len(d['groups'])==2; print('3D viewer OpenGL:', d.get('viewer_gl'), d.get('gl_renderer'))" "$HLBAKE_SELFTEST"
 
       - uses: actions/upload-artifact@v4
         if: always()

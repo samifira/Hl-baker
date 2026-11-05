@@ -38,6 +38,13 @@ for name in sorted(getattr(sys, "stdlib_module_names", ())):
 hiddenimports += collect_submodules("hlbake")
 datas += [("icon.png", "."), ("blender_addon/hl_baker.py", "blender_addon")]
 
+# Windows: Qt's software OpenGL renderer, used when the GPU driver lacks OpenGL 3.3
+if sys.platform == "win32":
+    import os as _os, PySide6 as _ps
+    _sw = _os.path.join(_os.path.dirname(_ps.__file__), "opengl32sw.dll")
+    if _os.path.exists(_sw):
+        binaries += [(_sw, "PySide6"), (_sw, ".")]
+
 a = Analysis(
     ["hlbake_main.py"],
     pathex=["."],

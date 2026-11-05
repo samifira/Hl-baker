@@ -991,6 +991,7 @@ class MainWindow(QMainWindow):
                     self.grab().save(os.path.splitext(selftest)[0] + ".png")
                     with open(selftest, "w") as fh:
                         json.dump({"exit": code, "viewer_gl": self.viewer3d.view.ok,
+                                   "gl_renderer": self.viewer3d.view.renderer,
                                    "groups": [g.__dict__ for g in self.project.groups]}, fh)
                     QApplication.instance().quit()
                 QTimer.singleShot(2500, finish)
@@ -1176,9 +1177,43 @@ def dark_palette(app):
     app.setStyleSheet(STYLE)
 
 
+def _gl33_available():
+    from PySide6.QtGui import QOpenGLContext, QSurfaceFormat
+    ctx = QOpenGLContext()
+    ctx.setFormat(QSurfaceFormat.defaultFormat())
+    if not ctx.create():
+        return False
+    f = ctx.format()
+    return (f.majorVersion(), f.minorVersion()) >= (3, 3)
+
+
+def _relaunch_with_software_gl(argv):
+    """Windows: start again with Qt's bundled software OpenGL (opengl32sw.dll)."""
+    import subprocess
+    env = dict(os.environ, HLBAKE_SOFTWARE_GL="1")
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, *argv]
+    else:
+        main_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "hlbake_main.py")
+        cmd = [sys.executable, main_py, *argv]
+    subprocess.Popen(cmd, env=env)
+
+
 def main(argv=None):
+    from PySide6.QtCore import QCoreApplication
     request_gl_format()
+    software_gl = os.environ.get("HLBAKE_SOFTWARE_GL") == "1"
+    if software_gl:
+        QCoreApplication.setAttribute(Qt.AA_UseSoftwareOpenGL)
     app = QApplication(sys.argv[:1])
+    if sys.platform == "win32" and not software_gl and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+        try:
+            if not _gl33_available():
+                _relaunch_with_software_gl(list(argv or []))
+                return 0
+        except Exception:
+            pass
     app.setApplicationName(APP_NAME)
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if os.path.exists(os.path.join(base, "icon.png")):

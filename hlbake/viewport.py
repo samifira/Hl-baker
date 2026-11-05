@@ -369,6 +369,8 @@ class Viewport(QOpenGLWidget):
         self.setMinimumSize(320, 240)
         self.setFocusPolicy(Qt.StrongFocus)
         self.ok = False
+        self.software = False
+        self.renderer = ""
         self.error = "" if HAVE_GL else "PyOpenGL is not installed"
         # camera
         self.target = np.zeros(3, np.float32)
@@ -438,7 +440,10 @@ class Viewport(QOpenGLWidget):
                 self.defaults[k] = _solid_texture(rgba)
             self.defaults["_black"] = _solid_texture((0, 0, 0, 255))
             self._build_grid()
+            self.renderer = GL.glGetString(GL.GL_RENDERER).decode(errors="replace")
             self.ok = True
+            import os as _os
+            self.software = _os.environ.get("HLBAKE_SOFTWARE_GL") == "1"
             self.status.emit(f"OpenGL {ver.decode(errors='replace').split(' ')[0]} — "
                              f"{GL.glGetString(GL.GL_RENDERER).decode(errors='replace')}")
         except Exception as e:
