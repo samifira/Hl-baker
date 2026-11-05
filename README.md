@@ -33,6 +33,10 @@ Blender's Cycles renderer, which is bundled inside. Users don't need Blender ins
 3. Tick the maps, pick resolution, anti-aliasing and padding, and choose the output folder.
 4. Click **Bake**. Each map appears on the model in the **3D Viewer** as soon as it's done.
 
+The viewer needs OpenGL 3.3 (any GPU from the last ~12 years). On Windows PCs without it (virtual
+machines, remote desktop, very old graphics), the app automatically uses a bundled software
+renderer (Mesa llvmpipe). That's slower but works.
+
 **3D Viewer controls:** left-drag orbit, right- or middle-drag pan, wheel zoom, Shift+right-drag
 rotate the light, F or double-click frame. Keys: N normal map, H high poly, C cage, W wireframe,
 L low poly, 0–9 switch channel.
