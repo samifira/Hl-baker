@@ -109,6 +109,20 @@ jobs:
           ls out_frozen
           test $(ls out_frozen | wc -l) -eq 14
 
+      - name: Smoke test packaged corrected-mesh export
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          json.dump({"files": [
+              {"path": os.path.abspath("tests/props_low.fbx"), "role": "low"},
+              {"path": os.path.abspath("tests/props_high_cm_yup.fbx"), "role": "high",
+               "transform": {"loc": [0, 0, 0], "rot": [90, 0, 0], "scale": [0.01, 0.01, 0.01]}}],
+              "settings": {}}, open("export_test.hlbake", "w"))
+          PY
+          "${{ steps.paths.outputs.cli }}" worker export export_test.hlbake --format SAME | grep '"event": "exported"'
+          test -f tests/props_high_cm_yup_aligned.fbx
+
       - name: Smoke test packaged GUI (loads meshes via its worker, screenshots, quits)
         shell: bash
         run: |

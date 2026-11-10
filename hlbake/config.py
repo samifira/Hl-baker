@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field, asdict, fields
 
 APP_NAME = "HL Baker"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 PROJECT_EXT = ".hlbake"
 
 # key: (label, file suffix, is_color(sRGB), background RGB)
@@ -117,7 +117,9 @@ class Settings:
 class FileEntry:
     path: str
     role: str = "auto"                 # auto | low | high | cage
-    scale: float = 1.0
+    scale: float = 1.0                 # import scale (CLI --scale)
+    transform: dict = field(default_factory=lambda: {"loc": [0.0, 0.0, 0.0], "rot": [0.0, 0.0, 0.0],
+                                                     "scale": [1.0, 1.0, 1.0]})
 
 
 @dataclass
@@ -138,6 +140,8 @@ class Project:
     settings: Settings = field(default_factory=Settings)
     default_cage_offset: float = 0.05
     default_max_ray: float = 0.0
+    object_transforms: dict = field(default_factory=dict)   # object name -> transform (on top of file)
+    hidden: list = field(default_factory=list)              # object names hidden in the 3D viewer
 
     def to_dict(self):
         return {"app": APP_NAME, "version": APP_VERSION,
@@ -145,7 +149,9 @@ class Project:
                 "groups": [asdict(g) for g in self.groups],
                 "settings": asdict(self.settings),
                 "default_cage_offset": self.default_cage_offset,
-                "default_max_ray": self.default_max_ray}
+                "default_max_ray": self.default_max_ray,
+                "object_transforms": self.object_transforms,
+                "hidden": list(self.hidden)}
 
     def save(self, path):
         with open(path, "w", encoding="utf-8") as fh:
@@ -155,11 +161,15 @@ class Project:
     def from_dict(cls, d):
         known = {f.name for f in fields(Settings)}
         st = Settings(**{k: v for k, v in d.get("settings", {}).items() if k in known})
-        return cls(files=[FileEntry(**f) for f in d.get("files", [])],
+        fe_known = {f.name for f in fields(FileEntry)}
+        return cls(files=[FileEntry(**{k: v for k, v in f.items() if k in fe_known})
+                          for f in d.get("files", [])],
                    groups=[GroupConfig(**g) for g in d.get("groups", [])],
                    settings=st,
                    default_cage_offset=d.get("default_cage_offset", 0.05),
-                   default_max_ray=d.get("default_max_ray", 0.0))
+                   default_max_ray=d.get("default_max_ray", 0.0),
+                   object_transforms=dict(d.get("object_transforms", {})),
+                   hidden=list(d.get("hidden", [])))
 
     @classmethod
     def load(cls, path):
@@ -169,3 +179,15 @@ class Project:
 
 def enabled_maps(s):
     return [k for k in MAP_ORDER if getattr(s, "map_" + k)]
+
+
+def clean_name(name):
+    """Same as Blender's bpy.path.clean_name (texture set names must match the worker's)."""
+    return re.sub(r"[^A-Za-z0-9]", "_", name)
+
+
+def texture_set_name(settings, group_name=None):
+    """Texture set a group's maps are written to (mirrors core.texture_set_name)."""
+    if settings.output_mode == "PER_GROUP" and group_name is not None:
+        return clean_name(group_name)
+    return clean_name(settings.base_name.strip()) if settings.base_name.strip() else "bake"

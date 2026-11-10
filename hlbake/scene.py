@@ -86,18 +86,56 @@ def import_file(path, scale=1.0):
         o.hide_viewport = False
         o.hide_render = False
     bpy.context.view_layer.update()
+    FILE_OBJECTS[path] = new
     return meshes
 
 
-def load_project_meshes(project):
-    """Import every file. Returns list of dicts: {obj, role, file}."""
+FILE_OBJECTS = {}   # file path -> every object that file created (meshes, empties, ...)
+
+
+def apply_world_transform(ob, M):
+    """Move an object's geometry by world-space matrix M, keeping its object transform and
+    hierarchy (the correction goes into the mesh data, so exports keep their pivots)."""
+    from mathutils import Matrix
+    M = Matrix([list(r) for r in M])
+    if ob.data.users > 1:
+        ob.data = ob.data.copy()
+    mw = ob.matrix_world.copy()
+    local = mw.inverted_safe() @ M @ mw
+    ob.data.transform(local)
+    if local.determinant() < 0:
+        ob.data.flip_normals()
+    ob.data.update()
+
+
+def apply_project_transforms(project, items):
+    from . import xform
+    by_path = {fe.path: fe for fe in project.files}
+    changed = 0
+    for it in items:
+        fe = by_path.get(it["file"])
+        M = xform.combined(fe.transform if fe else None,
+                           project.object_transforms.get(it["obj"].name))
+        if not np.allclose(M, np.identity(4), atol=1e-12):
+            apply_world_transform(it["obj"], M)
+            changed += 1
+    if changed:
+        bpy.context.view_layer.update()
+    return changed
+
+
+def load_project_meshes(project, apply_transforms=True):
+    """Import every file. Returns list of dicts: {obj, role, file, base}."""
     reset_scene()
+    FILE_OBJECTS.clear()
     items = []
     for fe in project.files:
         for ob in import_file(fe.path, fe.scale):
             base, kind = split_name(ob.name)
             role = fe.role if fe.role != "auto" else (kind or "unassigned")
             items.append({"obj": ob, "role": role, "file": fe.path, "base": base})
+    if apply_transforms:
+        apply_project_transforms(project, items)
     return items
 
 
@@ -177,24 +215,20 @@ def setname_for(s, g):
 
 
 def scan(project, mesh_out=None):
-    items = load_project_meshes(project)
-    groups, unmatched = auto_groups(items, project.default_cage_offset, project.default_max_ray)
-    result = {"objects": describe(items), "groups": [g.__dict__ for g in groups],
-              "unmatched": unmatched}
-    if mesh_out:
+    items = load_project_meshes(project, apply_transforms=False)
+    result = {}
+    if mesh_out:                 # viewer meshes are exported untransformed (transforms are live)
         from .meshexport import export_display_meshes
-        if project.groups:          # keep the user's groups (e.g. opened project)
-            rgroups, _ = resolve_groups(project, items)
-        else:
-            rgroups = [core.RuntimeGroup(g.name, bpy.data.objects[g.low],
-                                         [bpy.data.objects[h] for h in g.highs], None, g.cage_offset)
-                       for g in groups]
         try:
-            export_display_meshes(rgroups, mesh_out, lambda g: setname_for(project.settings, g),
-                                  project.settings.use_uv)
+            export_display_meshes(items, mesh_out, project.settings.use_uv)
             result["mesh_file"] = mesh_out
         except Exception as e:  # the viewer is optional; never fail a scan because of it
-            result["mesh_error"] = str(e)
+            import traceback
+            result["mesh_error"] = f"{e}\n{traceback.format_exc()}"
+    apply_project_transforms(project, items)
+    groups, unmatched = auto_groups(items, project.default_cage_offset, project.default_max_ray)
+    result.update({"objects": describe(items), "groups": [g.__dict__ for g in groups],
+                   "unmatched": unmatched})
     return result
 
 
@@ -339,3 +373,87 @@ def render_preview(project, out_path, yaw=35.0, pitch=25.0, width=960, height=72
         sc.cycles.use_denoising = False
         bpy.ops.render.render(write_still=True)
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Export corrected meshes
+# ---------------------------------------------------------------------------
+EXPORT_FORMATS = {"FBX": ".fbx", "OBJ": ".obj", "GLB": ".glb", "GLTF": ".gltf"}
+_SAME_FORMAT = {".fbx": "FBX", ".obj": "OBJ", ".glb": "GLB", ".gltf": "GLTF", ".ply": "PLY",
+                ".stl": "STL", ".usd": "USD", ".usda": "USD", ".usdc": "USD", ".usdz": "USD",
+                ".abc": "ABC", ".blend": "FBX"}
+
+
+def file_has_corrections(project, fe, names):
+    from . import xform
+    return (not xform.is_identity(fe.transform)
+            or any(not xform.is_identity(project.object_transforms.get(n)) for n in names))
+
+
+def _export_selected(fmt, path):
+    if fmt == "FBX":
+        _enable_addon("io_scene_fbx")
+        bpy.ops.export_scene.fbx(filepath=path, use_selection=True, use_mesh_modifiers=False,
+                                 mesh_smooth_type='OFF', use_custom_props=True,
+                                 path_mode='AUTO')
+    elif fmt == "OBJ":
+        bpy.ops.wm.obj_export(filepath=path, export_selected_objects=True, apply_modifiers=False,
+                              export_materials=True, export_normals=True, export_uv=True)
+    elif fmt in ("GLB", "GLTF"):
+        _enable_addon("io_scene_gltf2")
+        bpy.ops.export_scene.gltf(filepath=path, use_selection=True,
+                                  export_format='GLB' if fmt == "GLB" else 'GLTF_SEPARATE')
+    elif fmt == "PLY":
+        bpy.ops.wm.ply_export(filepath=path, export_selected_objects=True)
+    elif fmt == "STL":
+        bpy.ops.wm.stl_export(filepath=path, export_selected_objects=True)
+    elif fmt == "USD":
+        bpy.ops.wm.usd_export(filepath=path, selected_objects_only=True)
+    elif fmt == "ABC":
+        bpy.ops.wm.alembic_export(filepath=path, selected=True)
+    else:
+        raise SceneError(f"Unknown export format {fmt}")
+
+
+def export_corrected(project, fmt="SAME", suffix="_aligned", only=None):
+    """Write a corrected copy of every file that has transforms. Returns [{source, path}]."""
+    items = load_project_meshes(project, apply_transforms=True)
+    names_by_file = {}
+    for it in items:
+        names_by_file.setdefault(it["file"], []).append(it["obj"].name)
+    written = []
+    for fe in project.files:
+        if only and fe.path not in only:
+            continue
+        if not file_has_corrections(project, fe, names_by_file.get(fe.path, [])):
+            continue
+        src_ext = os.path.splitext(fe.path)[1].lower()
+        f = _SAME_FORMAT.get(src_ext, "FBX") if fmt == "SAME" else fmt
+        ext = src_ext if (fmt == "SAME" and src_ext != ".blend") else \
+            EXPORT_FORMATS.get(f, {"PLY": ".ply", "STL": ".stl", "USD": ".usd", "ABC": ".abc"}.get(f))
+        stem = os.path.splitext(fe.path)[0]
+        out = stem + suffix + ext
+        objs = [o for o in FILE_OBJECTS.get(fe.path, []) if o.name in bpy.data.objects]
+        # give objects back the names they had in the file ("crate.001" -> "crate") when another
+        # file's object took the name during import
+        for o in objs:
+            want = DUP_STRIP.sub("", o.name)
+            if want != o.name and want not in [x.name for x in objs]:
+                other = bpy.data.objects.get(want)
+                if other is not None:
+                    other.name = want + "__hlb_tmp"
+                o.name = want
+        for o in bpy.context.view_layer.objects:
+            o.select_set(False)
+        for o in objs:
+            o.hide_set(False)
+            o.select_set(True)
+        if objs:
+            bpy.context.view_layer.objects.active = objs[0]
+        _export_selected(f, out)
+        written.append({"source": fe.path, "path": out})
+    return written
+
+
+import re as _re  # noqa: E402
+DUP_STRIP = _re.compile(r"\.\d{3}$")

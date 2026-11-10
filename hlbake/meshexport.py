@@ -171,32 +171,27 @@ def cluster_decimate(P, N, F, target):
     return P2.astype(np.float32), N2.astype(np.float32), F2.astype(np.int32)
 
 
-def export_display_meshes(groups, out_path, setname_of, uv_name=""):
-    """groups: list of core.RuntimeGroup. Writes one .npz for the viewer."""
-    arrays, meta = {}, {"groups": [], "high_decimated": False}
-    total_high = sum(len(h.data.polygons) * 2 for g in groups for h in g.highs)
+def export_display_meshes(items, out_path, uv_name=""):
+    """items: [{obj, role, file}] (untransformed: the viewer applies project transforms live).
+    Writes one .npz: lows per corner with tangents, highs/cages indexed."""
+    arrays, meta = {}, {"objects": [], "high_decimated": False}
+    shown = [it for it in items if it["role"] in ("low", "high", "cage")]
+    total_high = sum(len(it["obj"].data.polygons) * 2 for it in shown if it["role"] == "high")
     budget_ratio = min(1.0, HIGH_TRI_LIMIT / max(total_high, 1))
-    lo_all, hi_all = [], []
-    for gi, g in enumerate(groups):
-        low = export_low(g.low, uv_name)
-        for k, v in low.items():
-            arrays[f"g{gi}_low_{k}"] = v
-        lo_all.append(low["P"].min(0)); hi_all.append(low["P"].max(0))
-        highs = []
-        for hi_i, h in enumerate(g.highs):
-            P, N, F = export_high(h)
-            if budget_ratio < 1.0:
+    for i, it in enumerate(shown):
+        ob, role = it["obj"], it["role"]
+        key = f"o{i}"
+        if role == "low":
+            for k, v in export_low(ob, uv_name).items():
+                arrays[f"{key}_{k}"] = v
+        else:
+            P, N, F = export_high(ob)
+            if role == "high" and budget_ratio < 1.0:
                 P, N, F = cluster_decimate(P, N, F, max(2000, int(len(F) * budget_ratio)))
                 meta["high_decimated"] = True
-            arrays[f"g{gi}_high{hi_i}_P"] = P
-            arrays[f"g{gi}_high{hi_i}_N"] = N
-            arrays[f"g{gi}_high{hi_i}_F"] = F.astype(np.uint32)
-            highs.append(h.name)
-            lo_all.append(P.min(0)); hi_all.append(P.max(0))
-        meta["groups"].append({"name": g.name, "low": g.low.name, "highs": highs,
-                               "set": setname_of(g), "cage_offset": g.cage_offset})
-    if lo_all:
-        meta["bounds"] = [np.min(lo_all, 0).tolist(), np.max(hi_all, 0).tolist()]
+            arrays[f"{key}_P"], arrays[f"{key}_N"] = P, N
+            arrays[f"{key}_F"] = F.astype(np.uint32)
+        meta["objects"].append({"key": key, "name": ob.name, "role": role, "file": it["file"]})
     arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8)
     np.savez(out_path, **arrays)
     return out_path

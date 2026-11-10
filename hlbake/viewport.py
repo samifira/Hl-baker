@@ -116,11 +116,12 @@ LOW_VS = """#version 330 core
 layout(location=0) in vec3 aP; layout(location=1) in vec3 aN; layout(location=2) in vec3 aT;
 layout(location=3) in float aS; layout(location=4) in vec2 aUV; layout(location=5) in vec3 aVN;
 layout(location=6) in vec3 aBary;
-uniform mat4 uVP; uniform float uOffset;
+uniform mat4 uVP; uniform mat4 uModel; uniform mat3 uNrm; uniform float uDet; uniform float uOffset;
 out vec3 vP; out vec3 vN; out vec3 vT; out float vS; out vec2 vUV; out vec3 vBary;
 void main(){
-  vec3 p = aP + aVN * uOffset;
-  vP = p; vN = aN; vT = aT; vS = aS; vUV = aUV; vBary = aBary;
+  vec3 n = normalize(uNrm * aN);
+  vec3 p = (uModel * vec4(aP, 1.0)).xyz + normalize(uNrm * aVN) * uOffset;
+  vP = p; vN = n; vT = normalize(mat3(uModel) * aT); vS = aS * uDet; vUV = aUV; vBary = aBary;
   gl_Position = uVP * vec4(p, 1.0);
 }"""
 
@@ -202,8 +203,9 @@ void main(){
 
 SOLID_VS = """#version 330 core
 layout(location=0) in vec3 aP; layout(location=1) in vec3 aN;
-uniform mat4 uVP; out vec3 vN; out vec3 vP;
-void main(){ vN = aN; vP = aP; gl_Position = uVP * vec4(aP, 1.0); }"""
+uniform mat4 uVP; uniform mat4 uModel; uniform mat3 uNrm; out vec3 vN; out vec3 vP;
+void main(){ vN = normalize(uNrm * aN); vP = (uModel * vec4(aP, 1.0)).xyz;
+  gl_Position = uVP * vec4(vP, 1.0); }"""
 
 SOLID_FS = """#version 330 core
 in vec3 vN; in vec3 vP; uniform vec3 uCam; uniform vec3 uLightDir; uniform vec3 uColor;
@@ -219,8 +221,11 @@ void main(){
 
 LINE_VS = """#version 330 core
 layout(location=0) in vec3 aP; layout(location=5) in vec3 aVN;
-uniform mat4 uVP; uniform float uOffset;
-void main(){ gl_Position = uVP * vec4(aP + aVN*uOffset, 1.0); }"""
+uniform mat4 uVP; uniform mat4 uModel; uniform mat3 uNrm; uniform float uOffset;
+void main(){
+  vec3 n = uNrm * aVN; float l = length(n);
+  vec3 p = (uModel * vec4(aP, 1.0)).xyz + (l > 0.0 ? n / l : n) * uOffset;
+  gl_Position = uVP * vec4(p, 1.0); }"""
 
 LINE_FS = """#version 330 core
 uniform vec4 uColor; out vec4 frag; void main(){ frag = uColor; }"""
@@ -314,6 +319,8 @@ class Program:
             a = np.asarray(v, np.float32)
             if a.shape == (4, 4):
                 GL.glUniformMatrix4fv(l, 1, GL.GL_TRUE, a)
+            elif a.shape == (3, 3):
+                GL.glUniformMatrix3fv(l, 1, GL.GL_TRUE, a)
             elif a.shape == (3,):
                 GL.glUniform3f(l, *a)
             elif a.shape == (4,):
@@ -426,6 +433,7 @@ class Viewport(QOpenGLWidget):
         self.target = np.zeros(3, np.float32)
         self.yaw, self.pitch, self.dist = 35.0, 22.0, 5.0
         self.radius = 1.0
+        self._framed = False
         self._drag = None
         # display state
         self.channel = "lit"
@@ -440,17 +448,39 @@ class Viewport(QOpenGLWidget):
         self.exposure = 1.0
         # data
         self._pending_meshes = None
+        self._keep_camera = False
         self._pending_tex = {}          # (set, key) -> path
-        self.groups = []                # dicts: name, set, low Mesh, highs [Mesh], cage_offset
-        self.cage_offsets = {}
+        self.objects = {}               # name -> {role, file, mesh, lo, hi}
+        self.matrices = {}              # name -> 4x4 world transform (project transforms)
+        self.hidden = set()             # object names hidden in the viewer
+        self.low_info = {}              # low name -> {set, cage_offset, cage}
         self.textures = {}              # (set, key) -> GL id
         self.tex_paths = {}             # (set, key) -> path loaded
         self.defaults = {}
 
     # ------------------------------------------------------------- public API
-    def load_meshes(self, path):
-        """Queue an .npz from the worker; uploaded on the next paint."""
+    def load_meshes(self, path, keep_camera=False):
+        """Queue an .npz from the worker; uploaded on the next paint. keep_camera: a reload of
+        the same scene (don't re-frame)."""
         self._pending_meshes = path
+        self._keep_camera = keep_camera and self._framed
+        self.update()
+
+    def set_object_matrix(self, name, M):
+        self.matrices[name] = np.asarray(M, np.float64)
+        self.update()
+
+    def set_matrices(self, mats):
+        self.matrices = {k: np.asarray(v, np.float64) for k, v in mats.items()}
+        self.update()
+
+    def set_hidden(self, names):
+        self.hidden = set(names)
+        self.update()
+
+    def set_low_info(self, info):
+        """info: low name -> {"set": texture set, "cage_offset": float, "cage": cage object name}"""
+        self.low_info = dict(info)
         self.update()
 
     def set_texture(self, setname, key, path):
@@ -461,11 +491,29 @@ class Viewport(QOpenGLWidget):
         self._pending_tex[("*", "*")] = None
         self.update()
 
-    def set_cage_offset(self, group_name, value):
-        self.cage_offsets[group_name] = float(value)
-        self.update()
+    def scene_bounds(self, visible_only=True):
+        pts = []
+        for name, o in self.objects.items():
+            if visible_only and name in self.hidden:
+                continue
+            c = np.array([[x, y, z] for x in (o["lo"][0], o["hi"][0]) for y in (o["lo"][1], o["hi"][1])
+                          for z in (o["lo"][2], o["hi"][2])])
+            M = self.matrices.get(name)
+            pts.append(c if M is None else c @ M[:3, :3].T + M[:3, 3])
+        if not pts:
+            return None
+        pts = np.concatenate(pts)
+        return pts.min(0), pts.max(0)
 
     def frame(self):
+        b = self.scene_bounds() or self.scene_bounds(False)
+        if b:
+            lo, hi = b
+            self.target = ((lo + hi) / 2).astype(np.float32)
+            self.radius = max(float(np.linalg.norm(hi - lo)) / 2, 1e-4)
+            self.grid_scale = 10 ** math.floor(math.log10(self.radius * 2)) / 2
+            self.grid_z = float(lo[2])
+            self._framed = True
         self.yaw, self.pitch = 35.0, 22.0
         self.dist = self.radius / math.sin(math.radians(22)) * 1.1
         self.update()
@@ -532,36 +580,34 @@ class Viewport(QOpenGLWidget):
         self.grid_scale = 1.0
 
     def _upload_meshes(self, path):
-        for g in self.groups:
-            g["low"].delete()
-            for h in g["highs"]:
-                h.delete()
-        self.groups = []
+        for o in self.objects.values():
+            o["mesh"].delete()
+        self.objects = {}
         d = np.load(path)
         meta = json.loads(bytes(d["meta"]).decode())
-        for gi, gm in enumerate(meta["groups"]):
-            P = d[f"g{gi}_low_P"]
-            bary = np.tile(np.identity(3, np.float32), (len(P) // 3, 1))
-            low = Mesh({0: P, 1: d[f"g{gi}_low_N"], 2: d[f"g{gi}_low_T"], 3: d[f"g{gi}_low_S"],
-                        4: d[f"g{gi}_low_UV"], 5: d[f"g{gi}_low_VN"], 6: bary})
-            low.set_lines(_unique_edges(P))
-            highs = []
-            for hi in range(len(gm["highs"])):
-                highs.append(Mesh({0: d[f"g{gi}_high{hi}_P"], 1: d[f"g{gi}_high{hi}_N"]},
-                                  d[f"g{gi}_high{hi}_F"]))
-            self.groups.append({"name": gm["name"], "set": gm["set"], "low": low, "highs": highs})
-            self.cage_offsets.setdefault(gm["name"], gm.get("cage_offset", 0.05))
-        b = meta.get("bounds")
-        if b:
-            lo, hi = np.array(b[0], np.float32), np.array(b[1], np.float32)
-            self.target = (lo + hi) / 2
-            self.radius = max(float(np.linalg.norm(hi - lo)) / 2, 1e-3)
-            self.grid_scale = 10 ** math.floor(math.log10(self.radius * 2)) / 2
-            self.grid_z = float(lo[2])
+        for om in meta["objects"]:
+            k, role = om["key"], om["role"]
+            P = d[f"{k}_P"]
+            if role == "low":
+                bary = np.tile(np.identity(3, np.float32), (len(P) // 3, 1))
+                mesh = Mesh({0: P, 1: d[f"{k}_N"], 2: d[f"{k}_T"], 3: d[f"{k}_S"],
+                             4: d[f"{k}_UV"], 5: d[f"{k}_VN"], 6: bary})
+                mesh.set_lines(_unique_edges(P))
+            else:
+                F = d[f"{k}_F"]
+                mesh = Mesh({0: P, 1: d[f"{k}_N"], 5: d[f"{k}_N"]}, F)
+                if role == "cage":
+                    mesh.set_lines(_unique_edges_indexed(F))
+            self.objects[om["name"]] = {"role": role, "file": om["file"], "mesh": mesh,
+                                        "lo": P.min(0), "hi": P.max(0)}
+        if not self._keep_camera:
             self.frame()
-        tris = sum(g["low"].count // 3 for g in self.groups)
-        htris = sum(h.count // 3 for g in self.groups for h in g["highs"])
-        msg = f"{len(self.groups)} group(s) · low {tris:,} tris · high {htris:,} tris"
+        n = {r: sum(1 for o in self.objects.values() if o["role"] == r) for r in ("low", "high", "cage")}
+        tris = sum(o["mesh"].count // 3 for o in self.objects.values() if o["role"] == "low")
+        htris = sum(o["mesh"].count // 3 for o in self.objects.values() if o["role"] == "high")
+        msg = f"{n['low']} low ({tris:,} tris) · {n['high']} high ({htris:,} tris)"
+        if n["cage"]:
+            msg += f" · {n['cage']} cage"
         if meta.get("high_decimated"):
             msg += " (high simplified for display)"
         self.status.emit(msg)
@@ -588,6 +634,19 @@ class Viewport(QOpenGLWidget):
                 self.textures[key] = _upload_texture(img, self.textures.get(key))
                 self.tex_paths[key] = path
 
+    def _set_model(self, prog, name):
+        M = self.matrices.get(name) if name else None
+        if M is None:
+            M = np.identity(4)
+        prog.set("uModel", M.astype(np.float32))
+        A = M[:3, :3]
+        try:
+            Nm = np.linalg.inv(A).T
+        except np.linalg.LinAlgError:
+            Nm = A
+        prog.set("uNrm", Nm.astype(np.float32))
+        prog.set("uDet", float(np.sign(np.linalg.det(A)) or 1.0))
+
     def _tex(self, setname, key):
         return self.textures.get((setname, key)) or self.defaults.get(key) or self.defaults["_black"]
 
@@ -601,7 +660,7 @@ class Viewport(QOpenGLWidget):
         trace = _slog if self._frames <= 2 else (lambda *a: None)
         trace("paint", self._frames, "pending meshes:", bool(self._pending_meshes))
         self._process_pending()
-        trace("pending processed; groups:", len(self.groups))
+        trace("pending processed; objects:", len(self.objects))
         dpr = self.devicePixelRatioF()
         w, h = int(self.width() * dpr), int(self.height() * dpr)
         GL.glViewport(0, 0, w, h)
@@ -629,18 +688,22 @@ class Viewport(QOpenGLWidget):
 
         trace("bg drawn")
         # ground grid
-        if self.groups:
+        if self.objects:
             self.p_line.use()
             s = self.grid_scale
             M = np.diag([s, s, 1, 1]).astype(np.float32)
             M[:3, 3] = (self.target[0], self.target[1], getattr(self, "grid_z", 0.0))
             self.p_line.set("uVP", VP @ M)
+            self._set_model(self.p_line, None)
             self.p_line.set("uOffset", 0.0)
             self.p_line.set("uColor", (0.32, 0.33, 0.36, 1.0))
             self.grid.draw_lines()
 
         trace("grid drawn")
-        if self.show_low:
+        visible = {n: o for n, o in self.objects.items() if n not in self.hidden}
+        lows = [(n, o) for n, o in visible.items() if o["role"] == "low"]
+        highs = [(n, o) for n, o in visible.items() if o["role"] == "high"]
+        if self.show_low and lows:
             self.p_low.use()
             pl = self.p_low
             pl.set("uVP", VP)
@@ -658,48 +721,59 @@ class Viewport(QOpenGLWidget):
             names = ("tAlbedo", "tNormal", "tAO", "tRough", "tMetal", "tEmit", "tChannel")
             for i, n in enumerate(names):
                 pl.set(n, i)
-            for g in self.groups:
-                keys = ("albedo", "normal", "ao", "roughness", "metalness", "emissive")
+            keys = ("albedo", "normal", "ao", "roughness", "metalness", "emissive")
+            for name, o in lows:
+                tset = self.low_info.get(name, {}).get("set", "")
                 for i, k in enumerate(keys):
                     GL.glActiveTexture(GL.GL_TEXTURE0 + i)
-                    GL.glBindTexture(GL.GL_TEXTURE_2D, self._tex(g["set"], k))
+                    GL.glBindTexture(GL.GL_TEXTURE_2D, self._tex(tset, k))
                 GL.glActiveTexture(GL.GL_TEXTURE0 + 6)
-                GL.glBindTexture(GL.GL_TEXTURE_2D, self._tex(g["set"], self.channel)
+                GL.glBindTexture(GL.GL_TEXTURE_2D, self._tex(tset, self.channel)
                                  if mode == 1 else self.defaults["_black"])
-                if self.show_high:     # push the low slightly back so the high can win where coplanar
+                self._set_model(pl, name)
+                if self.show_high and highs:   # push the low back so the high wins where coplanar
                     GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
                     GL.glPolygonOffset(1.0, 1.0)
-                g["low"].draw()
+                o["mesh"].draw()
                 GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
             GL.glActiveTexture(GL.GL_TEXTURE0)
 
         trace("low drawn")
-        if self.show_high:
-            self.p_solid.use()
-            self.p_solid.set("uVP", VP)
-            self.p_solid.set("uCam", eye)
-            self.p_solid.set("uLightDir", light)
-            self.p_solid.set("uColor", (0.72, 0.74, 0.78))
-            self.p_solid.set("uAlpha", 1.0)
-            for g in self.groups:
-                for h in g["highs"]:
-                    h.draw()
+        if self.show_high and highs:
+            ps = self.p_solid
+            ps.use()
+            ps.set("uVP", VP)
+            ps.set("uCam", eye)
+            ps.set("uLightDir", light)
+            ps.set("uColor", (0.72, 0.74, 0.78))
+            ps.set("uAlpha", 1.0)
+            for name, o in highs:
+                self._set_model(ps, name)
+                o["mesh"].draw()
 
         if self.show_cage:
-            self.p_line.use()
-            self.p_line.set("uVP", VP)
-            self.p_line.set("uColor", (1.0, 0.45, 0.15, 1.0))
+            pl = self.p_line
+            pl.use()
+            pl.set("uVP", VP)
             GL.glEnable(GL.GL_BLEND)
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
-            for g in self.groups:
-                self.p_line.set("uOffset", float(self.cage_offsets.get(g["name"], 0.05)))
-                GL.glDepthFunc(GL.GL_LEQUAL)
-                g["low"].draw_lines()
-                # faint pass through geometry so the whole cage is readable
-                GL.glDepthFunc(GL.GL_GREATER)
-                self.p_line.set("uColor", (1.0, 0.45, 0.15, 0.22))
-                g["low"].draw_lines()
-                self.p_line.set("uColor", (1.0, 0.45, 0.15, 1.0))
+            for name, o in [(n, o) for n, o in self.objects.items() if o["role"] == "low"]:
+                info = self.low_info.get(name, {})
+                cage = info.get("cage")
+                if cage and cage in self.objects:          # explicit cage mesh
+                    if cage in self.hidden:
+                        continue
+                    draw_name, offset = cage, 0.0
+                else:                                       # low pushed out by the cage offset
+                    if name in self.hidden:
+                        continue
+                    draw_name, offset = name, float(info.get("cage_offset", 0.05))
+                self._set_model(pl, draw_name)
+                pl.set("uOffset", offset)
+                for func, alpha in ((GL.GL_LEQUAL, 1.0), (GL.GL_GREATER, 0.22)):
+                    GL.glDepthFunc(func)               # faint pass shows the cage behind the mesh
+                    pl.set("uColor", (1.0, 0.45, 0.15, alpha))
+                    self.objects[draw_name]["mesh"].draw_lines()
             GL.glDepthFunc(GL.GL_LEQUAL)
             GL.glDisable(GL.GL_BLEND)
         trace("frame done")
@@ -895,3 +969,9 @@ class ViewerPanel(QWidget):
                 self.channel.setCurrentIndex(i)
         else:
             super().keyPressEvent(e)
+
+
+def _unique_edges_indexed(F):
+    F = np.asarray(F, np.int64).reshape(-1, 3)
+    e = np.sort(np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
+    return np.unique(e, axis=0)

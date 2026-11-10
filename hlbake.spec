@@ -71,7 +71,7 @@ coll = COLLECT(exe_gui, exe_cli, a.binaries, a.zipfiles, a.datas, strip=False, u
 
 if sys.platform == "darwin":
     app = BUNDLE(coll, name="HLBaker.app", icon=icon, bundle_identifier="org.hlbaker.app",
-                 info_plist={"NSHighResolutionCapable": True, "CFBundleShortVersionString": "1.0.0",
+                 info_plist={"NSHighResolutionCapable": True, "CFBundleShortVersionString": "1.2.0",
                              "CFBundleDocumentTypes": [{"CFBundleTypeName": "HL Baker Project",
                                                         "CFBundleTypeExtensions": ["hlbake"],
                                                         "CFBundleTypeRole": "Editor"}]})

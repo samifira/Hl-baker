@@ -22,7 +22,7 @@ def _emit(**ev):
 # ---------------------------------------------------------------------------
 def run_worker(argv):
     ap = argparse.ArgumentParser(prog="hlbake worker")
-    ap.add_argument("command", choices=["scan", "bake", "render"])
+    ap.add_argument("command", choices=["scan", "bake", "render", "export"])
     ap.add_argument("project")
     ap.add_argument("--out", default="")
     ap.add_argument("--yaw", type=float, default=35.0)
@@ -31,6 +31,9 @@ def run_worker(argv):
     ap.add_argument("--show", default="low")
     ap.add_argument("--preview-dir", default="")
     ap.add_argument("--mesh-out", default="")
+    ap.add_argument("--format", default="SAME")
+    ap.add_argument("--suffix", default="_aligned")
+    ap.add_argument("--only", action="append", default=[])
     a = ap.parse_args(argv)
     try:
         project = Project.load(a.project)
@@ -41,6 +44,9 @@ def run_worker(argv):
             t0 = time.time()
             written = scene.bake(project, _emit, preview_dir=a.preview_dir or None)
             _emit(event="done", files=written, seconds=round(time.time() - t0, 1))
+        elif a.command == "export":
+            _emit(event="exported", files=scene.export_corrected(project, a.format, a.suffix,
+                                                                 only=a.only or None))
         elif a.command == "render":
             path = scene.render_preview(project, a.out, yaw=a.yaw, pitch=a.pitch,
                                         samples=a.samples, show=a.show)

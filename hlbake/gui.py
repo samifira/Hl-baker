@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """HL Baker desktop UI (PySide6). The UI never imports bpy: all Blender work runs in a
 separate worker process (this same executable with the 'worker' argument)."""
+import copy
 import json
 import os
 import sys
 import tempfile
+import threading
+import time
 from dataclasses import fields
+
+import numpy as np
 
 from PySide6.QtCore import Qt, QProcess, QObject, Signal, QTimer, QSize, QSettings, QUrl
 from PySide6.QtGui import (QAction, QColor, QIcon, QKeySequence, QPalette, QPixmap, QImage,
@@ -16,13 +21,17 @@ from PySide6.QtWidgets import (
     QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QTreeWidget, QTreeWidgetItem,
     QTabWidget, QPlainTextEdit, QProgressBar, QFileDialog, QMessageBox, QScrollArea, QSplitter,
     QListWidget, QListWidgetItem, QGraphicsView, QGraphicsScene, QSlider, QMenu, QAbstractItemView,
-    QSizePolicy, QFrame)
+    QSizePolicy, QFrame, QDialog, QDialogButtonBox)
 
 from .config import (Project, FileEntry, GroupConfig, Settings, MAPS, MAP_ORDER, MATERIAL_MAPS,
                      GAME_PRESET, FORMATS, FORMAT_LABELS, MESH_EXTS, PROJECT_EXT, APP_NAME,
                      APP_VERSION, guess_file_role, enabled_maps)
 from .cli import EVENT_PREFIX
 from .viewport import ViewerPanel, request_gl_format
+from .transform_panel import TransformPanel
+from .watcher import MeshFileWatcher
+from . import xform, align
+from .config import texture_set_name
 
 ROLE_LABELS = [("auto", "Auto (by name)"), ("low", "Low poly"), ("high", "High poly"), ("cage", "Cage")]
 SIZES = [256, 512, 1024, 2048, 4096, 8192]
@@ -207,6 +216,23 @@ class MainWindow(QMainWindow):
         self.worker.output.connect(lambda t: self.log(t, dim=True))
         self.worker.finished.connect(self.on_worker_finished)
         self._pending_render = False
+        # transforms / outliner / parity / reload state
+        self.scene_pts = {}          # object name -> (role, file, raw points, is_triangle_soup)
+        self.obj_file = {}           # object name -> file path
+        self.target = None           # ("file", path) | ("object", name) | None
+        self.undo_stack, self.redo_stack = [], []
+        self._last_edit = 0.0
+        self._xf_state = self._transform_state()
+        self.parity = {}             # group name -> align.check() result
+        self.parity_ignored = set()
+        self._parity_gen = 0
+        self.maps_present = False
+        self._reload_queue = set()
+        self._reloading = None
+        self.watcher = MeshFileWatcher(self)
+        self.watcher.files_changed.connect(self.on_files_changed)
+        self.parity_done = _Relay(self)
+        self.parity_done.fire.connect(self._parity_results)
 
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
@@ -215,6 +241,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.load_project_into_ui()
         self.scan_timer = QTimer(self, singleShot=True, interval=300, timeout=self.scan)
+        self._xf_settle = QTimer(self, singleShot=True, interval=500,
+                                 timeout=lambda: (self.refresh_groups_tree(), self.schedule_parity()))
 
     # ------------------------------------------------------------------ UI
     def _build_menu(self):
@@ -232,11 +260,27 @@ class MainWindow(QMainWindow):
         a.setShortcut("Ctrl+I")
         a.triggered.connect(lambda: self.add_files_dialog("auto"))
         m.addAction(a)
+        a = QAction("Reload Meshes", self)
+        a.setShortcut("F5")
+        a.triggered.connect(lambda: self.reload_meshes())
+        m.addAction(a)
+        a = QAction("Export Corrected Meshes…", self)
+        a.triggered.connect(self.export_dialog)
+        m.addAction(a)
         m.addSeparator()
         a = QAction("&Quit", self)
         a.setShortcut(QKeySequence.Quit)
         a.triggered.connect(self.close)
         m.addAction(a)
+        e = self.menuBar().addMenu("&Edit")
+        self.undo_act = QAction("Undo Transform", self)
+        self.undo_act.setShortcut(QKeySequence.Undo)
+        self.undo_act.triggered.connect(self.undo)
+        self.redo_act = QAction("Redo Transform", self)
+        self.redo_act.setShortcuts([QKeySequence.Redo, QKeySequence("Ctrl+Shift+Z")])
+        self.redo_act.triggered.connect(self.redo)
+        e.addAction(self.undo_act)
+        e.addAction(self.redo_act)
         h = self.menuBar().addMenu("&Help")
         a = QAction("Naming Conventions", self)
         a.triggered.connect(self.show_naming_help)
@@ -253,6 +297,7 @@ class MainWindow(QMainWindow):
         lv.setSpacing(10)
         lv.addWidget(self._build_files())
         lv.addWidget(self._build_groups())
+        lv.addWidget(self._build_transform())
         lv.addWidget(self._build_maps())
         lv.addWidget(self._build_output())
         lv.addStretch(1)
@@ -309,6 +354,10 @@ class MainWindow(QMainWindow):
         split.setSizes([500, 940])
         self.setCentralWidget(split)
         self.statusBar().showMessage("Drop mesh files (FBX, OBJ, glTF…) anywhere to start")
+        self.stale_label = QLabel("")
+        self.stale_label.setObjectName("stale")
+        self.stale_label.setVisible(False)
+        self.statusBar().addPermanentWidget(self.stale_label)
 
     # -- files
     def _build_files(self):
@@ -323,6 +372,7 @@ class MainWindow(QMainWindow):
         self.files_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.files_table.setMinimumHeight(110)
         self.files_table.setMaximumHeight(160)
+        self.files_table.itemSelectionChanged.connect(self.file_selected)
         v.addWidget(self.files_table)
         row = QHBoxLayout()
         for text, role in (("+ Low…", "low"), ("+ High…", "high"), ("+ Cage…", "cage"),
@@ -338,6 +388,19 @@ class MainWindow(QMainWindow):
         rm.clicked.connect(self.remove_files)
         row.addWidget(rm)
         v.addLayout(row)
+        row2 = QHBoxLayout()
+        self.auto_reload = QCheckBox("Auto-reload changed files")
+        self.auto_reload.setToolTip("Reload a mesh file as soon as a new version is saved "
+                                    "(never re-bakes automatically)")
+        self.auto_reload.setChecked(self.qs.value("auto_reload", True, type=bool))
+        self.auto_reload.toggled.connect(self._auto_reload_toggled)
+        row2.addWidget(self.auto_reload)
+        row2.addStretch(1)
+        rl = QPushButton("Reload")
+        rl.setToolTip("Reload all mesh files now (F5)")
+        rl.clicked.connect(lambda: self.reload_meshes())
+        row2.addWidget(rl)
+        v.addLayout(row2)
         return box
 
     # -- groups
@@ -345,12 +408,17 @@ class MainWindow(QMainWindow):
         box = section("2  Bake Groups")
         v = QVBoxLayout(box)
         self.groups_tree = QTreeWidget()
-        self.groups_tree.setHeaderLabels(["Group / mesh", "Cage offset", "Max ray"])
+        self.groups_tree.setHeaderLabels(["Group / mesh", "", "Cage offset", "Max ray"])
+        self.groups_tree.headerItem().setToolTip(1, "Visible in the 3D viewer (Ctrl-click: show only this)")
+        self.groups_tree.headerItem().setIcon(1, eye_icon("on"))
         hdr = self.groups_tree.header()
         hdr.setStretchLastSection(False)
         hdr.setSectionResizeMode(0, QHeaderView.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.Fixed)
+        hdr.resizeSection(1, 30)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.groups_tree.itemClicked.connect(self.tree_clicked)
         self.groups_tree.setMinimumHeight(170)
         self.groups_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.groups_tree.customContextMenuRequested.connect(self.groups_menu)
@@ -380,11 +448,31 @@ class MainWindow(QMainWindow):
         self.groups_hint.setWordWrap(True)
         self.groups_hint.setObjectName("hint")
         v.addWidget(self.groups_hint)
+        self.parity_box = QWidget()
+        self.parity_layout = QVBoxLayout(self.parity_box)
+        self.parity_layout.setContentsMargins(0, 0, 0, 0)
+        self.parity_layout.setSpacing(4)
+        self.parity_box.setVisible(False)
+        v.addWidget(self.parity_box)
+        return box
+
+    def _build_transform(self):
+        box = section("3  Transform")
+        v = QVBoxLayout(box)
+        self.xf = TransformPanel()
+        self.xf.changed.connect(self.on_transform_edited)
+        self.xf.reset_requested.connect(self.reset_transform)
+        self.xf.align_requested.connect(lambda: self.auto_align_group(self._target_group()))
+        self.xf.export_requested.connect(self.export_dialog)
+        self.xf.undo_requested.connect(self.undo)
+        self.xf.redo_requested.connect(self.redo)
+        self.xf.set_undo_state(False, False)
+        v.addWidget(self.xf)
         return box
 
     # -- maps
     def _build_maps(self):
-        box = section("3  Maps")
+        box = section("4  Maps")
         v = QVBoxLayout(box)
         row = QHBoxLayout()
         for label, keys in (("None", ()), ("Game set", GAME_PRESET), ("All", MAP_ORDER)):
@@ -449,7 +537,7 @@ class MainWindow(QMainWindow):
 
     # -- output
     def _build_output(self):
-        box = section("4  Output")
+        box = section("5  Output")
         form = QFormLayout(box)
         form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         row = QHBoxLayout()
@@ -722,6 +810,9 @@ class MainWindow(QMainWindow):
             return
         self._scan_reset = reset
         self._old_groups = {g.name: g for g in self.project.groups}
+        if reset:
+            self._restore_groups = None
+            self.parity_ignored.clear()
         self.project.groups = [] if reset else self.project.groups
         self.collect_settings()
         self.progress.setRange(0, 0)
@@ -733,28 +824,61 @@ class MainWindow(QMainWindow):
 
     def apply_scan(self, ev):
         self.objects = ev.get("objects", [])
+        self.obj_file = {o["name"]: o["file"] for o in self.objects}
+        keep_camera = bool(self._reloading)
         if ev.get("mesh_file"):
-            self.viewer3d.view.load_meshes(ev["mesh_file"])
+            self._load_scene_points(ev["mesh_file"])
+            self.viewer3d.view.load_meshes(ev["mesh_file"], keep_camera=keep_camera)
         if ev.get("mesh_error"):
             self.log("3D viewer: could not export meshes: " + ev["mesh_error"])
-        groups = [GroupConfig(**g) for g in ev.get("groups", [])]
-        for g in groups:   # keep per-group tweaks across rescans
-            old = self._old_groups.get(g.name)
-            if old:
-                g.cage_offset, g.max_ray, g.enabled = old.cage_offset, old.max_ray, old.enabled
-            else:
-                g.cage_offset, g.max_ray = self.g_offset.value(), self.g_maxray.value()
-        self.project.groups = groups
+        restore = getattr(self, "_restore_groups", None)
+        unmatched = ev.get("unmatched", [])
+        if restore is not None:              # open project / reload: keep the user's groups
+            self.project.groups = restore
+            self._restore_groups = None
+            unmatched = []                    # missing objects are reported separately
+        else:
+            groups = [GroupConfig(**g) for g in ev.get("groups", [])]
+            for g in groups:   # keep per-group tweaks across rescans
+                old = self._old_groups.get(g.name)
+                if old:
+                    g.cage_offset, g.max_ray, g.enabled = old.cage_offset, old.max_ray, old.enabled
+                else:
+                    g.cage_offset, g.max_ray = self.g_offset.value(), self.g_maxray.value()
+            self.project.groups = groups
+        names = set(self.obj_file)
+        self.project.hidden = [n for n in self.project.hidden if n in names]
         uvs = sorted({u for o in self.objects if o["role"] == "low" for u in o["uvs"]})
         cur = self.w["use_uv"].currentText()
         self.w["use_uv"].clear()
         self.w["use_uv"].addItems([""] + uvs)
         self.w["use_uv"].setEditText(cur)
         self.refresh_groups_tree()
-        self.sync_viewer_cages()
+        self.sync_viewer()
+        self.update_hints(unmatched)
+        n_low = sum(o["role"] == "low" for o in self.objects)
+        n_high = sum(o["role"] == "high" for o in self.objects)
+        tris = sum(o["tris"] for o in self.objects if o["role"] == "high")
+        self.statusBar().showMessage(f"{n_low} low / {n_high} high meshes ({tris:,} high tris) "
+                                     f"in {len(self.project.groups)} group(s)")
+        self.watcher.watch([fe.path for fe in self.project.files])
+        self.schedule_parity()
+
+    def update_hints(self, unmatched=()):
         hints = []
-        if ev.get("unmatched"):
-            hints.append("No high poly for: " + ", ".join(ev["unmatched"]))
+        if unmatched:
+            hints.append("No high poly for: " + ", ".join(unmatched))
+        names = set(self.obj_file)
+        missing = sorted({n for g in self.project.groups for n in [g.low, *g.highs, g.cage]
+                          if n and n not in names})
+        if missing:
+            hints.append("Not found in the loaded files (renamed or deleted?): " + ", ".join(missing))
+        used = {n for g in self.project.groups for n in [g.low, *g.highs, g.cage] if n}
+        new = [o["name"] for o in self.objects if o["role"] in ("low", "high", "cage")
+               and o["name"] not in used]
+        if new and self.project.groups:
+            hints.append("Not in any group: " + ", ".join(new[:8]) + ("…" if len(new) > 8 else "")
+                         + "  (Re-detect groups to include them)")
         unassigned = [o["name"] for o in self.objects if o["role"] == "unassigned"]
         if unassigned:
             hints.append("Ignored (no _low/_high suffix): " + ", ".join(unassigned[:8])
@@ -764,44 +888,121 @@ class MainWindow(QMainWindow):
             hints.append("Low polys without UVs: " + ", ".join(nouv))
         self.groups_hint.setText("\n".join(hints))
         self.groups_hint.setVisible(bool(hints))
-        n_low = sum(o["role"] == "low" for o in self.objects)
-        n_high = sum(o["role"] == "high" for o in self.objects)
-        tris = sum(o["tris"] for o in self.objects if o["role"] == "high")
-        self.statusBar().showMessage(f"{n_low} low / {n_high} high meshes ({tris:,} high tris) "
-                                     f"in {len(groups)} group(s)")
+
+    def _load_scene_points(self, path):
+        """Keep raw (untransformed) points per object for parity checks and auto-align."""
+        try:
+            d = np.load(path)
+            meta = json.loads(bytes(d["meta"]).decode())
+            self.scene_pts = {o["name"]: (o["role"], o["file"], d[o["key"] + "_P"],
+                                          o["role"] == "low") for o in meta["objects"]}
+        except Exception as e:
+            self.scene_pts = {}
+            self.log(f"Could not read display meshes: {e}")
+
+    # ------------------------------------------------------------------ viewer sync
+    def world_matrix(self, name):
+        fe = next((f for f in self.project.files if f.path == self.obj_file.get(name)), None)
+        return xform.combined(fe.transform if fe else None, self.project.object_transforms.get(name))
+
+    def sync_viewer(self):
+        v = self.viewer3d.view
+        v.set_matrices({n: self.world_matrix(n) for n in self.obj_file})
+        v.set_hidden(self.project.hidden)
+        s = self.collect_settings()
+        v.set_low_info({g.low: {"set": texture_set_name(s, g.name), "cage_offset": g.cage_offset,
+                                "cage": g.cage} for g in self.project.groups if g.low})
 
     def sync_viewer_cages(self):
-        for g in self.project.groups:
-            self.viewer3d.view.set_cage_offset(g.name, g.cage_offset)
+        self.sync_viewer()
 
     def refresh_groups_tree(self):
         t = self.groups_tree
+        sel = self._tree_selection_key()
         t.blockSignals(True)
         t.clear()
         info = {o["name"]: o for o in self.objects}
+        hidden = set(self.project.hidden)
+        loaded = bool(self.obj_file)
+        reselect = None
         for gi, g in enumerate(self.project.groups):
-            top = QTreeWidgetItem([g.name, f"{g.cage_offset:.4g}", f"{g.max_ray:.4g}" if g.max_ray else "∞"])
+            top = QTreeWidgetItem([g.name, "", f"{g.cage_offset:.4g}",
+                                   f"{g.max_ray:.4g}" if g.max_ray else "∞"])
             top.setFlags(top.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
             top.setCheckState(0, Qt.Checked if g.enabled else Qt.Unchecked)
+            top.setToolTip(0, "Checkbox: include this group in the bake")
             top.setData(0, Qt.UserRole, ("group", gi))
+            members = [n for n in [g.low, *g.highs, g.cage] if n]
+            n_hidden = sum(n in hidden for n in members)
+            top.setIcon(1, eye_icon("off" if n_hidden == len(members) and members else
+                                    "part" if n_hidden else "on"))
             ok = bool(g.low and g.highs)
             top.setForeground(0, QColor("#e6e6e6") if ok else QColor("#e08a5b"))
+            if g.name in self.parity and g.name not in self.parity_ignored:
+                top.setIcon(0, warn_icon())
+                top.setToolTip(0, "High and low don't line up — see the suggestion below the list")
             t.addTopLevelItem(top)
+            if sel == ("group", g.name):
+                reselect = top
 
             def child(kind, name):
-                o = info.get(name, {})
+                o = info.get(name)
                 extra = f"  ({o['tris']:,} tris)" if o else ""
                 c = QTreeWidgetItem([f"{kind}:  {name}{extra}"])
                 c.setData(0, Qt.UserRole, (kind, gi, name))
-                c.setForeground(0, QColor({"Low": "#8fc1ff", "High": "#ffc26b", "Cage": "#c79bff"}[kind]))
+                c.setIcon(1, eye_icon("off" if name in hidden else "on"))
+                c.setToolTip(1, "Show/hide in the 3D viewer (Ctrl-click: show only this)")
+                color = {"Low": "#8fc1ff", "High": "#ffc26b", "Cage": "#c79bff"}[kind]
+                if loaded and o is None:
+                    color = "#e06c6c"
+                    c.setToolTip(0, "Not found in the loaded files (renamed or deleted?)")
+                elif name in hidden:
+                    color = "#6b6f78"
+                if not xform.is_identity(self.project.object_transforms.get(name)):
+                    c.setText(0, c.text(0) + "  ⟲")
+                    c.setToolTip(0, "Has its own transform")
+                c.setForeground(0, QColor(color))
                 top.addChild(c)
-            child("Low", g.low)
-            for h in g.highs:
-                child("High", h)
-            if g.cage:
-                child("Cage", g.cage)
+                return c
+            for kind, name in [("Low", g.low)] + [("High", h) for h in g.highs] + \
+                    ([("Cage", g.cage)] if g.cage else []):
+                c = child(kind, name)
+                if sel == ("object", name):
+                    reselect = c
             top.setExpanded(True)
+        if reselect is not None:
+            t.setCurrentItem(reselect)
         t.blockSignals(False)
+
+    def _tree_selection_key(self):
+        it = self.groups_tree.currentItem()
+        d = it.data(0, Qt.UserRole) if it else None
+        if not d:
+            return None
+        if d[0] == "group":
+            return ("group", self.project.groups[d[1]].name) if d[1] < len(self.project.groups) else None
+        return ("object", d[2])
+
+    def tree_clicked(self, item, col):
+        if col != 1:
+            return
+        d = item.data(0, Qt.UserRole)
+        if not d:
+            return
+        g = self.project.groups[d[1]]
+        names = [n for n in [g.low, *g.highs, g.cage] if n] if d[0] == "group" else [d[2]]
+        hidden = set(self.project.hidden)
+        if QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.MetaModifier):
+            everything = set(self.obj_file) | {n for gg in self.project.groups
+                                                for n in [gg.low, *gg.highs, gg.cage] if n}
+            hidden = everything - set(names)              # solo
+        elif all(n in hidden for n in names):
+            hidden -= set(names)
+        else:
+            hidden |= set(names)
+        self.project.hidden = sorted(hidden)
+        self.refresh_groups_tree()
+        self.viewer3d.view.set_hidden(self.project.hidden)
 
     def _current_group(self):
         it = self.groups_tree.currentItem()
@@ -817,6 +1018,125 @@ class MainWindow(QMainWindow):
             self.g_offset.setValue(g.cage_offset)
             self.g_maxray.setValue(g.max_ray)
             self._loading = False
+        d = cur.data(0, Qt.UserRole) if cur else None
+        if d and d[0] != "group":
+            self.files_table.blockSignals(True)
+            self.files_table.clearSelection()
+            self.files_table.blockSignals(False)
+            self.set_target(("object", d[2]))
+        elif d:
+            self.set_target(None)
+
+    def file_selected(self):
+        rows = sorted({i.row() for i in self.files_table.selectedIndexes()})
+        if rows and rows[0] < len(self.project.files):
+            self.groups_tree.blockSignals(True)
+            self.groups_tree.setCurrentItem(None)
+            self.groups_tree.blockSignals(False)
+            self.set_target(("file", self.project.files[rows[0]].path))
+
+    # ------------------------------------------------------------------ transforms
+    def _target_group(self):
+        """The group the current selection belongs to (for auto-align)."""
+        g = self._current_group()
+        if g is not None:
+            return g
+        if self.target and self.target[0] == "object":
+            for g in self.project.groups:
+                if self.target[1] in [g.low, *g.highs, g.cage]:
+                    return g
+        return None
+
+    def set_target(self, target):
+        self.target = target
+        grp = self._target_group()
+        can_align = bool(grp and grp.low and grp.highs and self.scene_pts)
+        if target is None:
+            self.xf.set_target(None, can_align=can_align)
+        elif target[0] == "file":
+            fe = self._file_entry(target[1])
+            n = sum(1 for f in self.obj_file.values() if f == target[1])
+            self.xf.set_target(f"File: {os.path.basename(target[1])}  — moves all {n} mesh(es) "
+                               f"in it", fe.transform if fe else None, can_align)
+        else:
+            name = target[1]
+            src = os.path.basename(self.obj_file.get(name, "")) or "?"
+            self.xf.set_target(f"Object: {name}  — applied before its file's transform ({src})",
+                               self.project.object_transforms.get(name), can_align)
+
+    def _file_entry(self, path):
+        return next((f for f in self.project.files if f.path == path), None)
+
+    def _transform_state(self):
+        return (copy.deepcopy([f.transform for f in self.project.files]),
+                copy.deepcopy(self.project.object_transforms))
+
+    def _restore_transform_state(self, st):
+        files, objs = st
+        for fe, tr in zip(self.project.files, files):
+            fe.transform = copy.deepcopy(tr)
+        self.project.object_transforms = copy.deepcopy(objs)
+
+    def _push_undo(self, coalesce=False):
+        """Remember the state before an edit (rapid spinbox edits count as one step)."""
+        now = time.monotonic()
+        if not (coalesce and now - self._last_edit < 1.0 and self.undo_stack):
+            self.undo_stack.append(self._xf_state)
+            del self.undo_stack[:-100]
+            self.redo_stack.clear()
+        self._last_edit = now if coalesce else 0.0
+
+    def _transforms_changed(self):
+        self._xf_state = self._transform_state()
+        self.xf.set_undo_state(bool(self.undo_stack), bool(self.redo_stack))
+        self.sync_viewer()
+        self.refresh_groups_tree()
+        self.set_target(self.target)
+        self.schedule_parity()
+
+    def _write_target(self, tr):
+        if not self.target:
+            return
+        tr = xform.normalized(tr)
+        if self.target[0] == "file":
+            fe = self._file_entry(self.target[1])
+            if fe:
+                fe.transform = tr
+        else:
+            if xform.is_identity(tr):
+                self.project.object_transforms.pop(self.target[1], None)
+            else:
+                self.project.object_transforms[self.target[1]] = tr
+
+    def on_transform_edited(self, tr):
+        if not self.target:
+            return
+        self._push_undo(coalesce=True)
+        self._write_target(tr)
+        self._xf_state = self._transform_state()
+        self.xf.set_undo_state(bool(self.undo_stack), bool(self.redo_stack))
+        self.sync_viewer()                         # live, cheap
+        self._xf_settle.start()                    # outliner / parity after the edit settles
+
+    def reset_transform(self):
+        if self.target:
+            self._push_undo()
+            self._write_target(xform.identity())
+            self._transforms_changed()
+
+    def undo(self):
+        if self.undo_stack:
+            self.redo_stack.append(self._transform_state())
+            self._restore_transform_state(self.undo_stack.pop())
+            self._last_edit = 0.0
+            self._transforms_changed()
+
+    def redo(self):
+        if self.redo_stack:
+            self.undo_stack.append(self._transform_state())
+            self._restore_transform_state(self.redo_stack.pop())
+            self._last_edit = 0.0
+            self._transforms_changed()
 
     def set_group_value(self, attr, v):
         if self._loading:
@@ -830,7 +1150,7 @@ class MainWindow(QMainWindow):
             setattr(g, attr, v)
             self._update_group_row(g)
             if attr == "cage_offset":
-                self.viewer3d.view.set_cage_offset(g.name, v)
+                self.sync_viewer()
 
     def _update_group_row(self, g):
         gi = self.project.groups.index(g)
@@ -875,17 +1195,313 @@ class MainWindow(QMainWindow):
                 m.addAction("Remove from group", lambda: (src.highs.remove(name), self.refresh_groups_tree()))
             else:
                 m.addAction("Remove cage", lambda: (setattr(src, "cage", ""), self.refresh_groups_tree()))
-        elif d[0] == "group":
+        if d[0] in ("Low", "High", "Cage") and d[2] in self.project.object_transforms:
+            m.addAction("Clear this object's transform", lambda n=d[2]: self._clear_obj_transform(n))
+        if d[0] == "group" or d[0] in ("Low", "High", "Cage"):
+            g = self.project.groups[d[1]]
+            m.addAction("Auto-align highs to low", lambda g=g: self.auto_align_group(g))
+        if d[0] == "group":
             gi = d[1]
             m.addAction("Bake only this group", lambda: self.bake(only=gi))
             m.addAction("Rename", lambda: self.groups_tree.editItem(it, 0))
             m.addAction("Delete group", lambda: (self.project.groups.pop(gi), self.refresh_groups_tree()))
         m.exec(self.groups_tree.viewport().mapToGlobal(pos))
 
+    def _clear_obj_transform(self, name):
+        self._push_undo()
+        self.project.object_transforms.pop(name, None)
+        self._transforms_changed()
+
     def _move_high(self, gi, gj, name):
         self.project.groups[gi].highs.remove(name)
         self.project.groups[gj].highs.append(name)
         self.refresh_groups_tree()
+
+    # ------------------------------------------------------------------ parity / auto-align
+    def _group_points(self, g):
+        """World-space points of a group's low (triangles) and highs, or None if not loaded."""
+        if g.low not in self.scene_pts or not g.highs:
+            return None
+        highs = [h for h in g.highs if h in self.scene_pts]
+        if not highs:
+            return None
+        low = xform.apply_points(self.world_matrix(g.low), self.scene_pts[g.low][2])
+        high = np.concatenate([xform.apply_points(self.world_matrix(h), self.scene_pts[h][2])
+                               for h in highs])
+        return low, high
+
+    def schedule_parity(self):
+        """Check every group in the background; results arrive in _parity_results."""
+        self._parity_gen += 1
+        gen = self._parity_gen
+        jobs = []
+        for g in self.project.groups:
+            pts = self._group_points(g)
+            if pts is not None:
+                jobs.append((g.name, pts))
+        if not jobs:
+            self.parity = {}
+            self._show_parity()
+            return
+
+        def run():
+            res = {}
+            for name, (lo, hi) in jobs:
+                try:
+                    r = align.check(lo, hi)
+                except Exception as e:      # never let a check break the app
+                    r = None
+                    print("parity check failed", name, e)
+                if r is not None:
+                    res[name] = r
+            self.parity_done.fire.emit((gen, res))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _parity_results(self, payload):
+        gen, res = payload
+        if gen != self._parity_gen:          # transforms changed meanwhile: a newer check runs
+            return
+        self.parity = res
+        self._show_parity()
+        self.refresh_groups_tree()
+
+    def _show_parity(self):
+        while self.parity_layout.count():
+            w = self.parity_layout.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        shown = [(n, r) for n, r in self.parity.items() if n not in self.parity_ignored]
+        for name, r in shown:
+            fix_scope, _f, fix_D = self._fix_scope(name, r)
+            row = QFrame()
+            row.setObjectName("parity")
+            h = QHBoxLayout(row)
+            h.setContentsMargins(8, 5, 6, 5)
+            what = {"scale": "different sizes", "axes": "rotated", "offset": "offset from each other",
+                    "orientation": "rotated"}.get(r["reason"], "misaligned")
+            txt = (f"<b>{_html(name)}</b>: high and low look {what}. "
+                   f"Suggested fix: {_html(align.describe(fix_D, r['snapped']))}"
+                   f"{' — applies to the whole file' if fix_scope == 'file' else ''}.")
+            if r["ambiguous"]:
+                txt += " <i>The model is symmetric, check the result.</i>"
+            lab = QLabel(txt)
+            lab.setWordWrap(True)
+            h.addWidget(lab, 1)
+            fix = QPushButton("Fix")
+            fix.clicked.connect(lambda _=False, n=name: self.apply_parity_fix(n))
+            ign = QToolButton(text="✕")
+            ign.setToolTip("Ignore this warning")
+            ign.clicked.connect(lambda _=False, n=name: (self.parity_ignored.add(n), self._show_parity(),
+                                                        self.refresh_groups_tree()))
+            h.addWidget(fix)
+            h.addWidget(ign)
+            self.parity_layout.addWidget(row)
+        self.parity_box.setVisible(bool(shown))
+
+    def _fix_scope(self, group_name, r):
+        """Where a fix should go. Returns (scope, file, D):
+        ("file", path, D) when the high file is clearly the cause: every group whose highs come
+        from that file is off and one correction fits all of them (symmetric models can make the
+        per-group suggestions differ, so each candidate is tried on every group);
+        ("objects", None, r["D"]) otherwise: just this group's high polys."""
+        g = next((x for x in self.project.groups if x.name == group_name), None)
+        if g is None:
+            return "objects", None, r["D"]
+        files = {self.obj_file.get(h) for h in g.highs}
+        if len(files) != 1 or None in files:
+            return "objects", None, r["D"]
+        f = files.pop()
+        in_file = [n for n, p in self.obj_file.items() if p == f]
+        if any(n in self.project.object_transforms for n in in_file) or \
+                any(self.obj_file.get(x.low) == f for x in self.project.groups):
+            return "objects", None, r["D"]           # overrides / lows in that file: be local
+        sharing = [x for x in self.project.groups if any(self.obj_file.get(h) == f for h in x.highs)]
+        if any(x.name not in self.parity for x in sharing):
+            return "objects", None, r["D"]           # some group in that file is already fine
+        cands = [r["D"]] + [self.parity[x.name]["D"] for x in sharing if x.name != group_name]
+        rng = np.random.default_rng(0)
+        for D in cands:
+            ok = True
+            for x in sharing:
+                pts = self._group_points(x)
+                if pts is None:
+                    continue
+                lo, hi = pts
+                L = align.sample_triangles(lo, 600, rng)
+                H = align.subsample(xform.apply_points(D, hi), 2500, rng)
+                diag = float(np.linalg.norm(lo.max(0) - lo.min(0)))
+                if align.fit_error(L, H) / diag > self.parity[x.name]["error_after"] * 1.25 + 0.005:
+                    ok = False
+                    break
+            if ok:
+                return "file", f, D
+        return "objects", None, r["D"]
+
+    def _apply_correction(self, g, D, scope=None):
+        """Apply world-space correction D to a file (scope "file") or to the group's highs."""
+        scope, f = scope if scope else ("objects", None)
+        if scope == "file":
+            fe = self._file_entry(f)
+            fe.transform = xform.decompose(D @ xform.matrix(fe.transform))
+        else:
+            for h in g.highs:
+                # world = F @ O; want D @ F @ O = F @ O'  ->  O' = F^-1 @ D @ F @ O
+                F = xform.matrix(self._file_entry(self.obj_file.get(h)).transform
+                                 if self._file_entry(self.obj_file.get(h)) else None)
+                cur = xform.matrix(self.project.object_transforms.get(h))
+                tr = xform.decompose(np.linalg.inv(F) @ D @ F @ cur)
+                if xform.is_identity(tr):
+                    self.project.object_transforms.pop(h, None)
+                else:
+                    self.project.object_transforms[h] = tr
+
+    def apply_parity_fix(self, name):
+        r = self.parity.get(name)
+        g = next((x for x in self.project.groups if x.name == name), None)
+        if not r or not g:
+            return
+        scope, f, D = self._fix_scope(name, r)
+        self._push_undo()
+        if scope == "file":
+            self._apply_correction(g, D, (scope, f))
+            for x in self.project.groups:             # the same file fix covers these too
+                if x.name in self.parity and any(self.obj_file.get(h) == f for h in x.highs):
+                    self.parity.pop(x.name, None)
+            self.log(f"Fixed {os.path.basename(f)}: {align.describe(D, r['snapped'])}")
+        else:
+            self._apply_correction(g, r["D"])
+            self.parity.pop(name, None)
+            self.log(f"Fixed {name}: {align.describe(r['D'], r['snapped'])}")
+        self._show_parity()
+        self._transforms_changed()
+        self.statusBar().showMessage("Alignment fixed — Ctrl+Z to undo", 6000)
+
+    def auto_align_group(self, g):
+        if g is None:
+            QMessageBox.information(self, APP_NAME, "Select a group (or one of its meshes) first.")
+            return
+        pts = self._group_points(g)
+        if pts is None:
+            QMessageBox.information(self, APP_NAME, "This group needs a loaded low and high poly.")
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            r = align.auto_align(*pts)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if r["error_after"] >= r["error_before"] * 0.98:
+            self.statusBar().showMessage(f"{g.name}: already aligned, nothing to change", 6000)
+            return
+        self._push_undo()
+        self._apply_correction(g, r["D"])
+        self.parity.pop(g.name, None)
+        self._show_parity()
+        self._transforms_changed()
+        msg = f"{g.name}: {align.describe(r['D'], r['snapped'])}"
+        self.log("Auto-align " + msg)
+        if not r["confident"]:
+            QMessageBox.warning(self, APP_NAME, msg + "\n\nThe fit is not very close, please check "
+                                "the result in the 3D viewer (Ctrl+Z to undo).")
+        elif r["ambiguous"]:
+            self.statusBar().showMessage(msg + "  — symmetric model, check the result (Ctrl+Z to undo)",
+                                         10000)
+        else:
+            self.statusBar().showMessage(msg + "  (Ctrl+Z to undo)", 8000)
+
+    # ------------------------------------------------------------------ export corrected meshes
+    def export_dialog(self):
+        files = [fe.path for fe in self.project.files
+                 if not xform.is_identity(fe.transform)
+                 or any(f == fe.path and not xform.is_identity(self.project.object_transforms.get(n))
+                        for n, f in self.obj_file.items())]
+        if not files:
+            QMessageBox.information(self, APP_NAME, "No file has a transform yet, so there is "
+                                    "nothing to export. Fix the alignment first.")
+            return
+        dlg = ExportDialog(self, files)
+        if dlg.exec() != ExportDialog.Accepted:
+            return
+        self._export_switch = dlg.switch.isChecked()
+        self._export_only = dlg.selected()
+        if not self._export_only:
+            return
+        self.collect_settings()
+        self.set_busy(True)
+        self.progress.setRange(0, 0)
+        self.progress.setFormat("Exporting corrected meshes…")
+        extra = ["--format", dlg.fmt.currentData(), "--suffix", dlg.suffix.text() or "_aligned"]
+        for p in self._export_only:
+            extra += ["--only", p]
+        self.worker.start("export", self.project, extra)
+
+    def _exported(self, files):
+        if not files:
+            return
+        lines = "\n".join(f"  {os.path.basename(x['source'])}  →  {x['path']}" for x in files)
+        self.log("Exported corrected meshes:\n" + lines)
+        if getattr(self, "_export_switch", False):
+            self._push_undo()
+            for x in files:
+                fe = self._file_entry(x["source"])
+                if fe is None:
+                    continue
+                for n, f in list(self.obj_file.items()):
+                    if f == fe.path:
+                        self.project.object_transforms.pop(n, None)
+                fe.path = x["path"]
+                fe.transform = xform.identity()
+            self.undo_stack.clear()                  # file paths changed: old states don't apply
+            self.redo_stack.clear()
+            self.refresh_files_table()
+            self._restore_groups = list(self.project.groups)
+            QTimer.singleShot(0, lambda: self.reload_meshes(quiet=True))
+        QMessageBox.information(self, APP_NAME, f"Exported {len(files)} corrected file(s):\n\n" + lines)
+
+    # ------------------------------------------------------------------ auto reload
+    def _auto_reload_toggled(self, on):
+        self.qs.setValue("auto_reload", bool(on))
+        self.watcher.enabled = bool(on)
+
+    def on_files_changed(self, paths):
+        if not self.auto_reload.isChecked():
+            return
+        self._reload_queue.update(paths)
+        if not self.worker.busy():
+            self.reload_meshes()
+
+    def reload_meshes(self, quiet=False):
+        """Re-import the mesh files, keeping groups, transforms, visibility and the camera."""
+        if not self.project.files:
+            return
+        if self.worker.busy():
+            self._reload_queue.update(f.path for f in self.project.files)
+            return
+        changed = sorted(self._reload_queue) or [f.path for f in self.project.files]
+        self._reload_queue.clear()
+        self._reloading = {"files": changed, "quiet": quiet}
+        if getattr(self, "_restore_groups", None) is None:
+            self._restore_groups = list(self.project.groups)
+        self._old_groups = {g.name: g for g in self.project.groups}
+        self.collect_settings()
+        self.progress.setRange(0, 0)
+        self.progress.setFormat("Reloading meshes…")
+        self.set_busy(True)
+        self.worker.start("scan", self.project, ["--mesh-out", self.mesh_path])
+
+    def _after_reload(self):
+        info, self._reloading = self._reloading, None
+        self.watcher.mark_loaded()
+        if info and not info["quiet"]:
+            names = ", ".join(os.path.basename(p) for p in info["files"])
+            self.log(f"Reloaded {names}")
+            if self.maps_present:
+                self.stale_label.setText(f"⚠ {names} reloaded — maps may be out of date")
+                self.stale_label.setToolTip("The baked maps were made from the previous version of "
+                                            "the mesh. Bake again to update them.")
+                self.stale_label.setVisible(True)
+                self.statusBar().showMessage(f"{names} reloaded — maps may be out of date")
+            else:
+                self.statusBar().showMessage(f"{names} reloaded")
 
     # ------------------------------------------------------------------ bake / render
     def set_busy(self, busy):
@@ -964,9 +1580,13 @@ class MainWindow(QMainWindow):
                     self.thumbs.setCurrentItem(it)
         elif e == "scan":
             self.apply_scan(ev)
+        elif e == "exported":
+            self._exported(ev.get("files", []))
         elif e == "render":
             self.render_view.set_image(ev["path"])
         elif e == "done":
+            self.maps_present = True
+            self.stale_label.setVisible(False)
             self.log(f"--- Done: {len(ev['files'])} file(s) in {ev['seconds']}s")
             self.statusBar().showMessage(f"Baked {len(ev['files'])} maps in {ev['seconds']}s → "
                                          f"{self.project.settings.output_dir}")
@@ -981,10 +1601,18 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(100 if code == 0 else 0)
         self.progress.setFormat({"bake": "Bake finished", "scan": "Meshes loaded",
-                                 "render": "Preview rendered"}.get(cmd, "Done") if code == 0
+                                 "render": "Preview rendered",
+                                 "export": "Export finished"}.get(cmd, "Done") if code == 0
                                 else "Stopped")
         if cmd == "scan":
             self.refresh_groups_tree()
+            if self._reloading:
+                self._after_reload()
+            else:
+                self.watcher.mark_loaded()
+        if self._reload_queue and not self.worker.busy():
+            QTimer.singleShot(0, self.reload_meshes)
+        if cmd == "scan":
             selftest = os.environ.get("HLBAKE_SELFTEST")
             if selftest:   # smoke test used by CI: report groups, screenshot, quit
                 def finish():
@@ -1023,6 +1651,14 @@ class MainWindow(QMainWindow):
         self.project = Project()
         self.project_path = None
         self.objects = []
+        self.obj_file, self.scene_pts, self.parity = {}, {}, {}
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.maps_present = False
+        self.stale_label.setVisible(False)
+        self.watcher.watch([])
+        self._show_parity()
+        self.set_target(None)
         self.thumbs.clear()
         self.load_project_into_ui()
 
@@ -1039,6 +1675,10 @@ class MainWindow(QMainWindow):
             return
         self.project_path = path
         saved_groups = list(self.project.groups)
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self._xf_state = self._transform_state()
+        self.parity, self.parity_ignored = {}, set()
         self.load_project_into_ui()
         if self.project.files:
             # re-import to get object info, but keep the saved groups
@@ -1072,6 +1712,7 @@ class MainWindow(QMainWindow):
                 it.setData(Qt.UserRole, p)
                 it.setData(Qt.UserRole + 1, p)
                 self.thumbs.addItem(it)
+                self.maps_present = True
 
     def save_project(self):
         if not self.project_path:
@@ -1121,20 +1762,98 @@ def _html(t):
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-# patch: restore saved groups after an "open project" scan
-_orig_apply = MainWindow.apply_scan
+class _Relay(QObject):
+    """Carries results from a background thread to the GUI thread."""
+    fire = Signal(object)
 
 
-def _apply_scan(self, ev):
-    restore = getattr(self, "_restore_groups", None)
-    _orig_apply(self, ev)
-    if restore:
-        self.project.groups = restore
-        self._restore_groups = None
-        self.refresh_groups_tree()
+_ICONS = {}
 
 
-MainWindow.apply_scan = _apply_scan
+def eye_icon(state):
+    """Eye icons drawn in code: on / off (closed) / part (some members hidden)."""
+    if state in _ICONS:
+        return _ICONS[state]
+    from PySide6.QtGui import QPen, QPainterPath
+    pm = QPixmap(32, 32)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    col = QColor("#d8dbe0") if state == "on" else QColor("#8a8f98") if state == "part" else QColor("#5d6168")
+    pen = QPen(col, 2.6)
+    p.setPen(pen)
+    path = QPainterPath()
+    path.moveTo(3, 16)
+    path.quadTo(16, 3 if state != "off" else 26, 29, 16)
+    if state != "off":
+        path.quadTo(16, 29, 3, 16)
+    p.drawPath(path)
+    if state != "off":
+        p.setBrush(col)
+        p.drawEllipse(12, 12, 8, 8)
+    else:
+        for x in (8, 16, 24):
+            p.drawLine(x, 21 + (2 if x == 16 else 0), x - (2 if x < 16 else -2 if x > 16 else 0), 26)
+    p.end()
+    _ICONS[state] = QIcon(pm)
+    return _ICONS[state]
+
+
+def warn_icon():
+    if "warn" not in _ICONS:
+        pm = QPixmap(32, 32)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QColor("#e0a03c"))
+        p.setPen(Qt.NoPen)
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QPolygonF
+        p.drawPolygon(QPolygonF([QPointF(16, 3), QPointF(30, 28), QPointF(2, 28)]))
+        p.setPen(QColor("#1d1f22"))
+        f = p.font()
+        f.setBold(True)
+        f.setPixelSize(18)
+        p.setFont(f)
+        p.drawText(pm.rect().adjusted(0, 7, 0, 0), Qt.AlignCenter, "!")
+        p.end()
+        _ICONS["warn"] = QIcon(pm)
+    return _ICONS["warn"]
+
+
+class ExportDialog(QDialog):
+    def __init__(self, parent, files):
+        super().__init__(parent)
+        self.setWindowTitle("Export corrected meshes")
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel("Write copies of these files with the alignment applied to the geometry.\n"
+                           "Object names, pivots and materials are kept; the originals are untouched."))
+        self.checks = []
+        for path in files:
+            c = QCheckBox(os.path.basename(path))
+            c.setToolTip(path)
+            c.setChecked(True)
+            c.path = path
+            self.checks.append(c)
+            v.addWidget(c)
+        form = QFormLayout()
+        self.fmt = combo([("SAME", "Same as the original"), ("FBX", "FBX"), ("OBJ", "OBJ"),
+                          ("GLB", "glTF binary (.glb)"), ("GLTF", "glTF (.gltf + .bin)")])
+        form.addRow("Format", self.fmt)
+        self.suffix = QLineEdit("_aligned")
+        form.addRow("File name suffix", self.suffix)
+        v.addLayout(form)
+        self.switch = QCheckBox("Use the exported files in this project (their transforms reset)")
+        self.switch.setChecked(True)
+        v.addWidget(self.switch)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("Export")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def selected(self):
+        return [c.path for c in self.checks if c.isChecked()]
 
 
 # ---------------------------------------------------------------------------
@@ -1160,6 +1879,8 @@ QProgressBar::chunk { background: #d9822b; border-radius: 3px; }
 QTreeWidget, QTableWidget, QListWidget, QPlainTextEdit { background: #1f2124; border: 1px solid #34373d; }
 QTabWidget::pane { border: 1px solid #34373d; }
 QTabBar::tab { padding: 6px 14px; }
+QFrame#parity { background: #3a2f1f; border: 1px solid #6b5228; border-radius: 4px; }
+QLabel#stale { color: #f0b45a; padding-right: 8px; }
 """
 
 

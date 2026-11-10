@@ -11,7 +11,22 @@ Blender's Cycles renderer, which is bundled inside. Users don't need Blender ins
 - **Quick-load bake groups** from names: `crate_low`, `crate_high`, `crate_high1`, `crate_cage`
   (`_lp/_hp`, `_lo/_hi` also work). Highs whose names don't match a low go to the low they overlap.
   Right-click a high poly to move it to another group.
-- **Per-group cage offset and max ray distance**, or a custom cage mesh
+- **Per-group cage offset and max ray distance**, or a custom cage mesh (shown in the viewer)
+- **Transforms for mismatched files:** move / rotate / scale fields for a whole file or a single
+  object, with quick ±90° rotations, unit conversions (cm ↔ m, inches) and mirroring. Undo/redo.
+  Your source files are never modified; transforms are saved in the project.
+- **Automatic mismatch detection:** when a group's high and low don't line up (different units,
+  Y-up vs Z-up, offset), a warning appears with a one-click **Fix**. If every group from the
+  same file is off the same way, the fix goes on the file. **Auto-align** (right-click a group)
+  also handles arbitrary rotations and scales.
+- **Export corrected meshes:** writes `<name>_aligned.fbx` (or OBJ / glTF) next to the original,
+  with the correction applied to the geometry. Object names, pivots and materials are kept, and
+  the project can switch to the corrected files.
+- **Auto-reload:** when a mesh file is re-exported, it reloads by itself once the export has
+  finished, keeping groups, transforms, visibility and the camera. It never re-bakes; a note
+  says the maps may be out of date until you bake again.
+- **Outliner visibility:** an eye icon per group and mesh hides it in the 3D viewer
+  (Ctrl-click: show only that). Separate from the checkbox that includes a group in the bake.
 - **14 maps:** Normal (tangent, OpenGL/DirectX), Normal (object), Ambient Occlusion (with *Ignore
   Groups*), Curvature (ray-traced or vertex), Thickness, Height, Position, Material ID, Object ID,
   plus Albedo / Roughness / Metalness / Emissive / Opacity taken from the high poly's materials
@@ -29,6 +44,8 @@ Blender's Cycles renderer, which is bundled inside. Users don't need Blender ins
 
 1. Drop your low and high files onto the window (or use **+ Low… / + High…**).
    A file's role is guessed from its name. Change it in the *Role* column if needed.
+   If a warning says high and low don't line up, click **Fix**, or select the file or mesh and
+   use the **Transform** section.
 2. Check the groups. Set a **cage offset** large enough for rays to start outside the high poly.
 3. Tick the maps, pick resolution, anti-aliasing and padding, and choose the output folder.
 4. Click **Bake**. Each map appears on the model in the **3D Viewer** as soon as it's done.
